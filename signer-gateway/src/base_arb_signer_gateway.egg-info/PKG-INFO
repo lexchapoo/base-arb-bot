@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: base-arb-signer-gateway
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: eth-account>=0.13
+Requires-Dist: eth-utils>=5.2
+Requires-Dist: fastapi>=0.115
+Requires-Dist: httpx>=0.28
+Requires-Dist: pydantic-settings>=2.8
+Requires-Dist: rlp>=4.1
+Requires-Dist: uvicorn>=0.34
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3; extra == "dev"

@@ -1,0 +1,21 @@
+{
+  "opportunity_id": "base-weth-usdc-demo",
+  "chain_id": 8453,
+  "target_block": 99999999,
+  "observed_block": 99999999,
+  "asset": "0x4200000000000000000000000000000000000006",
+  "amount_in": "1000000000000000000",
+  "gross_profit_usd": 3.25,
+  "gas_cost_usd": 0.22,
+  "hedge_cost_usd": 0.0,
+  "inventory_risk_usd": 0.0,
+  "success_probability": 0.88,
+  "revert_probability": 0.06,
+  "stale_probability": 0.04,
+  "leakage_probability": 0.02,
+  "revert_cost_usd": 0.18,
+  "stale_loss_usd": 0.35,
+  "opportunity_loss_usd": 0.50,
+  "route_hops": 2,
+  "route_hash": "0x1111111111111111111111111111111111111111111111111111111111111111"
+}

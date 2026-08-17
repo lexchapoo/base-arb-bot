@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "base-arb-bot"
+version = "0.7.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "pydantic>=2.10",
+  "pydantic-settings>=2.8",
+  "httpx>=0.28",
+  "web3>=7.8",
+  "sqlalchemy>=2.0",
+  "asyncpg>=0.30",
+  "eth-abi>=5.2",
+  "eth-utils>=5.2"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25"]
+
+[tool.setuptools.packages.find]
+where=["src"]

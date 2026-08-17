@@ -1,0 +1,1 @@
+Add Base mainnet-fork tests here after installing Foundry. Required cases: unauthorized callback, altered route hash, stale target block, adapter allowlist failure, repayment shortfall, profit floor failure, fee-on-transfer token, reentrancy, and successful Aave flash-loan execution against verified Base deployments.

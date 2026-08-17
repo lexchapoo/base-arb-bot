@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: arb
+      POSTGRES_PASSWORD: arb
+      POSTGRES_DB: arb
+    ports: ["5432:5432"]
+    volumes:
+      - arb-postgres:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  python-api:
+    build: ./python
+    env_file: .env
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      rust-executor: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+  rust-executor:
+    build: ./rust-executor
+    env_file: .env
+    ports: ["8085:8085"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8085/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+volumes:
+  arb-postgres:

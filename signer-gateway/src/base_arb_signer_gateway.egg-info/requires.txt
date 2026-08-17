@@ -1,0 +1,10 @@
+eth-account>=0.13
+eth-utils>=5.2
+fastapi>=0.115
+httpx>=0.28
+pydantic-settings>=2.8
+rlp>=4.1
+uvicorn>=0.34
+
+[dev]
+pytest>=8.3

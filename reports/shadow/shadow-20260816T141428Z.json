@@ -1,0 +1,48 @@
+{
+  "configuration": {
+    "dry_run": true,
+    "live_trading": false
+  },
+  "database": {
+    "candidates": 168,
+    "evaluation_latency_ms": {
+      "max": 2,
+      "median": 2,
+      "min": 1,
+      "p95": 2,
+      "samples": 168
+    },
+    "expected_net_profit_units": [],
+    "non_dry_submissions": 0,
+    "pending_pool_events": 7,
+    "provider_disagreement": {
+      "detected": 0,
+      "measured": 0
+    },
+    "rejection_reasons": {
+      "missing_config:EXECUTOR_ADDRESS": 168,
+      "missing_config:EXECUTOR_OWNER_ADDRESS": 168
+    },
+    "simulation_successes": 0,
+    "would_submit": 0
+  },
+  "duration_seconds": 60,
+  "ended_at": "2026-08-16T14:15:28.678534+00:00",
+  "gate": {
+    "dry_run_enforced": true,
+    "duration_met": false,
+    "exact_simulations_observed": false,
+    "live_trading_disabled": true,
+    "no_live_submissions": true,
+    "pending_events_observed": true,
+    "pending_logs_enabled_all_samples": true,
+    "provider_disagreement_measured": false,
+    "route_evaluations_observed": true,
+    "websocket_connected_all_samples": true
+  },
+  "health_samples": 13,
+  "mode": "shadow-smoke",
+  "passed": false,
+  "required_duration_seconds": 3600,
+  "started_at": "2026-08-16T14:14:28.623354+00:00"
+}
