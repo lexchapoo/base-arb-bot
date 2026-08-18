@@ -53,3 +53,17 @@ jobs:
         run: cd contracts && forge build
       - name: Test (excludes Base mainnet fork; that needs an RPC secret)
         run: cd contracts && forge test --no-match-path 'test/BaseMainnetFork.t.sol' -vvv
+
+  fork-test:
+    name: Solidity (Base mainnet fork)
+    runs-on: ubuntu-latest
+    # Needs the BASE_HTTP_RPC secret, which GitHub withholds from fork PRs, so
+    # only run on pushes to the repo (and manual dispatch).
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Fork tests against pinned Base state
+        env:
+          BASE_HTTP_RPC: ${{ secrets.BASE_HTTP_RPC }}
+        run: cd contracts && forge test --match-path 'test/BaseMainnetFork.t.sol' -vvv
