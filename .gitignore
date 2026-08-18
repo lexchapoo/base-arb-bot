@@ -11,3 +11,9 @@ contracts/out/
 .claude/
 .swarm/
 .hive-mind/
+
+# Echidna / crytic fuzzing artifacts
+echidna-corpus/
+crytic-export/
+contracts/echidna-corpus/
+contracts/crytic-export/

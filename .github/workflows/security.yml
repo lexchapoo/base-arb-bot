@@ -35,6 +35,22 @@ jobs:
           tool: cargo-audit
       - run: cd rust-executor && cargo audit
 
+  echidna:
+    name: Echidna (property fuzzing)
+    runs-on: ubuntu-latest
+    # Fuzzing is slow; run on pushes to master and the weekly schedule, not on
+    # every PR. Fork PRs would also lack any needed setup.
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: crytic/echidna-action@v2
+        with:
+          files: contracts/test/echidna/BaseArbExecutorEchidna.sol
+          contract: BaseArbExecutorEchidna
+          config: contracts/echidna.config.yaml
+          solc-version: 0.8.24
+
   slither:
     name: Slither (Solidity)
     runs-on: ubuntu-latest

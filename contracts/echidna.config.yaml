@@ -1,0 +1,10 @@
+# Echidna configuration for BaseArbExecutorEchidna.
+# Run: echidna contracts/test/echidna/BaseArbExecutorEchidna.sol \
+#        --contract BaseArbExecutorEchidna --config contracts/echidna.config.yaml
+testMode: property
+testLimit: 50000
+# Fuzz the executor and mocks directly, not just the test contract.
+allContracts: true
+# Default unprivileged senders (none is the executor owner / test contract).
+sender: ["0x10000", "0x20000", "0x30000"]
+corpusDir: echidna-corpus
