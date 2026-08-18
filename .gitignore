@@ -5,3 +5,9 @@ __pycache__/
 target/
 contracts/cache/
 contracts/out/
+
+# Ruflo / claude-flow runtime state (not source)
+.claude-flow/
+.claude/
+.swarm/
+.hive-mind/
