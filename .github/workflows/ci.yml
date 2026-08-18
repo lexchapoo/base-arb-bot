@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  python:
+    name: Python (tests + static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pip install "./python[dev]"
+      - name: Unit tests
+        run: python -m pytest -q python/tests
+      - name: Signer policy tests
+        run: PYTHONPATH=signer-gateway/src python -m pytest -q signer-gateway/tests
+      - name: Static compile
+        run: |
+          python -m compileall -q python/src python/tests
+          python -m compileall -q signer-gateway/src signer-gateway/tests \
+            scripts_prepare_deployment.py scripts_deploy_via_signer.py
+
+  rust:
+    name: Rust (cargo test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-executor
+      - name: Test
+        run: cd rust-executor && cargo test
+      - name: Clippy
+        run: cd rust-executor && cargo clippy --all-targets --all-features -- -D warnings
+
+  solidity:
+    name: Solidity (forge test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Build
+        run: cd contracts && forge build
+      - name: Test (excludes Base mainnet fork; that needs an RPC secret)
+        run: cd contracts && forge test --no-match-path 'test/BaseMainnetFork.t.sol' -vvv
