@@ -144,6 +144,19 @@ def test_conservative_eip1559_size_increases_with_calldata():
     assert large > small
 
 
+def test_refine_amounts_samples_between_neighbors():
+    grid=[1,4,16,64]
+    out=RouteOptimizer._refine_amounts(grid,16,3)   # neighbours 4 and 64
+    assert out==sorted(out)
+    assert out and all(4 < a < 64 for a in out)
+    assert 16 not in out
+
+
+def test_refine_amounts_disabled_or_unknown_best():
+    assert RouteOptimizer._refine_amounts([1,2,4],4,0)==[]      # points=0
+    assert RouteOptimizer._refine_amounts([1,2,4],99,3)==[]     # best not in grid
+
+
 def test_dedup_collapses_rotations_keeps_reverse():
     p1=_pm(P1,A,B,"v1"); p2=_pm(P2,B,C,"v2"); p3=_pm(P3,C,A,"v3")
     ring=Cycle((p1,p2,p3),(A,B,C,A))          # A->B->C->A

@@ -23,10 +23,15 @@ class Settings(BaseSettings):
     # Upper bound on quote/cycle evaluations run concurrently. Caps in-flight
     # RPC calls so parallel evaluation does not overwhelm the provider.
     quote_concurrency: int = 8
+    # After the coarse candidate grid, quote this many extra sizes between the
+    # best size's neighbors (one more batched round) to sharpen the optimum.
+    # 0 disables refinement.
+    size_refinement_points: int = 4
     rust_executor_url: str = "http://localhost:8081"
     quote_timeout_seconds: float = 4.0
     execution_rpc_timeout_seconds: float = 8.0
     uniswap_v3_quoter_v2: str = ""
+    uniswap_v3_factory: str = ""
     aerodrome_router: str = ""
     aerodrome_factory: str = ""
     executor_address: str = ""

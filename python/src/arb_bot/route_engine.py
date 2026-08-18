@@ -163,6 +163,29 @@ class RouteOptimizer:
         return sorted(values)
 
     @staticmethod
+    def _refine_amounts(grid: list[int], best_amount: int, points: int) -> list[int]:
+        """Sizes strictly between the best candidate's neighbours in the grid.
+
+        Used for one extra batched quote round to sharpen the optimal size.
+        Deterministic and integer-only.
+        """
+        ordered = sorted(set(grid))
+        if points <= 0 or best_amount not in ordered:
+            return []
+        idx = ordered.index(best_amount)
+        lo = ordered[idx - 1] if idx > 0 else max(1, best_amount // 2)
+        hi = ordered[idx + 1] if idx + 1 < len(ordered) else best_amount
+        if hi <= lo:
+            return []
+        span = hi - lo
+        out: set[int] = set()
+        for k in range(1, points + 1):
+            candidate = lo + span * k // (points + 1)
+            if candidate > 0 and candidate != best_amount:
+                out.add(candidate)
+        return sorted(out)
+
+    @staticmethod
     def _dedup_cycles(cycles: list[Cycle]) -> list[Cycle]:
         """Collapse rotations of the same directed ring.
 
@@ -322,19 +345,30 @@ class RouteOptimizer:
             quoted, quote_blockers = await self._parallel_quotes(cycle, amounts)
         blockers.extend(quote_blockers)
 
-        best_amount: int | None = None
-        best_out: int | None = None
-        best_profit: int | None = None
-        # Iterate candidates in deterministic ascending order; strict `>` keeps
-        # the smallest size on a profit tie, matching the pre-batch behaviour.
-        for amount in amounts:
-            item = quoted.get(amount)
-            if item is None:
-                continue
-            out, _quotes = item
-            profit = out - amount
-            if best_profit is None or profit > best_profit:
-                best_amount, best_out, best_profit = amount, out, profit
+        def _pick_best(candidates: dict[int, tuple[int, list[Quote]]]) -> tuple[int | None, int | None]:
+            # Iterate in deterministic ascending order; strict `>` keeps the
+            # smallest size on a profit tie, matching pre-batch behaviour.
+            b_amount: int | None = None
+            b_out: int | None = None
+            b_profit: int | None = None
+            for amount in sorted(candidates):
+                out, _quotes = candidates[amount]
+                profit = out - amount
+                if b_profit is None or profit > b_profit:
+                    b_amount, b_out, b_profit = amount, out, profit
+            return b_amount, b_out
+
+        best_amount, best_out = _pick_best(quoted)
+
+        # Second batched round: sharpen the optimum by quoting sizes between the
+        # best candidate's neighbours. Stays fully batched and deterministic.
+        if batched and best_amount is not None and settings.size_refinement_points > 0:
+            refined = self._refine_amounts(amounts, best_amount, settings.size_refinement_points)
+            if refined:
+                extra, refine_blockers = await self._batched_quotes(cycle, refined, observed_block)
+                blockers.extend(refine_blockers)
+                quoted.update(extra)
+                best_amount, best_out = _pick_best(quoted)
 
         if best_amount is None or best_out is None:
             if not blockers:

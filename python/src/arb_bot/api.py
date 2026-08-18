@@ -4,7 +4,9 @@ from time import perf_counter
 from decimal import Decimal
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import select, text
+from . import metrics
 from .config import settings
 from .models import RouteCandidate, ScoreResult, ExecutionEnvelope, PoolRegistration, PendingLogTrigger
 from .scoring import RiskGate
@@ -70,6 +72,27 @@ def register_pool(pool: PoolRegistration):
 @app.get("/pools")
 def pools():
     return pool_graph.snapshot()
+
+@app.post("/pools/discover")
+async def discover_pools(payload: dict | None = None):
+    """Discover verified Uniswap V3 / Aerodrome pools for a token set and register them.
+
+    Tokens default to those of the currently configured pools. Only pools whose
+    on-chain token pair is confirmed are registered; no synthetic metadata.
+    """
+    from .discovery import PoolDiscovery
+    tokens = (payload or {}).get("tokens") if isinstance(payload, dict) else None
+    if not tokens:
+        configured = load_configured_pools(settings.watched_pools_json, settings.watched_pool_addresses)
+        tokens = sorted({t for pool in configured for t in (pool.token0, pool.token1)})
+    if not tokens:
+        raise HTTPException(422, "no tokens to discover from; configure pools or pass {\"tokens\": [...]}")
+    discovered = await PoolDiscovery.from_settings(settings).discover(tokens)
+    registered = []
+    for metadata in discovered:
+        pool_graph.register(metadata)
+        registered.append(metadata.address)
+    return {"tokens": tokens, "discovered": len(discovered), "registered": registered, "graph": pool_graph.snapshot()}
 
 @app.post("/route-trigger")
 async def route_trigger(trigger: PendingLogTrigger):
@@ -196,15 +219,31 @@ async def route_trigger(trigger: PendingLogTrigger):
                 except Exception as exc:
                     auto_submissions.append({"route_id":result.route_id,"accepted":False,"error":type(exc).__name__})
 
+    submission_candidates=sum(1 for result in evaluations if result.submission_eligible)
+    metrics.inc("arb_route_triggers_total")
+    metrics.inc("arb_route_triggers_known_pool_total" if affected["known_pool"] else "arb_route_triggers_unknown_pool_total")
+    metrics.inc("arb_route_evaluations_total", len(evaluations))
+    metrics.inc("arb_route_submission_eligible_total", submission_candidates)
+    metrics.observe_latency_ms(evaluation_latency_ms)
+
     return {
         "triggered":bool(affected["known_pool"]),
         "reason":"route_optimizer_evaluated" if affected["known_pool"] else "pool_not_registered",
         **affected,
         "route_evaluations":[result.to_dict() for result in evaluations],
-        "submission_candidates":sum(1 for result in evaluations if result.submission_eligible),
+        "submission_candidates":submission_candidates,
         "packed_batch_plan":packed_batch_plan.to_dict() if packed_batch_plan else None,
         "auto_submissions":auto_submissions,
     }
+
+@app.get("/metrics")
+def prometheus_metrics() -> PlainTextResponse:
+    graph = pool_graph.snapshot()
+    gauges = {
+        "arb_dry_run": 1 if settings.dry_run else 0,
+        "arb_registered_pools": graph["pool_count"],
+    }
+    return PlainTextResponse(metrics.render(gauges))
 
 @app.post("/score", response_model=ScoreResult)
 async def score(candidate: RouteCandidate):
