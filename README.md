@@ -246,3 +246,41 @@ make check
 ```
 
 Codex should read `AGENTS.md` before editing. `make check` runs Python checks and runs Rust/Foundry checks when those toolchains are installed; missing toolchains are reported as `NOT RUN` rather than treated as successful. Keep `DRY_RUN=true` while validating the deployment.
+
+## Latency & reliability (route evaluation)
+
+An arbitrage opportunity on Base lives roughly one to two blocks (~2–4s), so
+route evaluation is tuned to fit inside that window.
+
+Quoting:
+
+- Pool quotes are batched through Multicall3 (`arb_bot.multicall`): one
+  `aggregate3` request per hop across every candidate size, instead of one RPC
+  round-trip per candidate.
+- First-hop balances are prefetched in a single multicall rather than one
+  `balanceOf` per cycle.
+- Rotational-duplicate cycles (the same directed ring enumerated from different
+  entry points) are collapsed before evaluation; the reverse direction is kept.
+- Candidate sizes and cycles are quoted concurrently behind a bounded semaphore
+  (`QUOTE_CONCURRENCY`).
+
+Together these bring a single `/route-trigger` evaluation from tens of seconds
+down to a couple of seconds against a standard Base RPC. Note the quoter itself
+(`quoteExactInputSingle`) is ~1s of on-chain compute per call, so competitive
+production searching still benefits from local node state rather than remote
+quote simulation.
+
+Executor ingestion (Rust):
+
+- One pooled HTTP client with bounded request/connect timeouts is reused for
+  `/route-trigger` POSTs, so a stalled POST cannot permanently leak a
+  concurrency permit (`MAX_INFLIGHT_ROUTE_TRIGGERS`,
+  `ROUTE_TRIGGER_TIMEOUT_SECONDS`).
+- The `pendingLogs` WebSocket has an idle-timeout heartbeat: if no message
+  arrives within `WS_IDLE_TIMEOUT_SECONDS` the subscription is treated as
+  silently stalled and reconnected, instead of blocking forever on a
+  connected-but-dead socket.
+
+Tuning knobs (see `.env.example`): `MAX_QUOTE_EVALUATIONS`, `QUOTE_CONCURRENCY`,
+`ROUTE_TRIGGER_TIMEOUT_SECONDS`, `WS_IDLE_TIMEOUT_SECONDS`,
+`MAX_INFLIGHT_ROUTE_TRIGGERS`.
