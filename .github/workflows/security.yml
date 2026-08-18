@@ -44,8 +44,8 @@ jobs:
       - uses: crytic/slither-action@v0.4.0
         with:
           target: contracts/
-          # Report-only: the executor intentionally uses guarded reentrancy,
-          # assembly, low-level calls and timestamp checks that Slither flags.
-          # Findings stay in the job log for review; triage via a slither
-          # config is follow-up work rather than a hard CI gate.
-          fail-on: none
+          slither-config: contracts/slither.config.json
+          # Triaged categories are excluded in slither.config.json (see
+          # contracts/SLITHER_TRIAGE.md); a new high-severity finding outside
+          # them fails the build.
+          fail-on: high

@@ -1,0 +1,6 @@
+{
+  "filter_paths": "src/mocks.sol",
+  "exclude_informational": true,
+  "exclude_optimization": true,
+  "detectors_to_exclude": "reentrancy-balance,reentrancy-no-eth,reentrancy-benign,reentrancy-events,timestamp,calls-loop,incorrect-equality,unused-return,uninitialized-local"
+}
