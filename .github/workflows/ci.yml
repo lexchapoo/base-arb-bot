@@ -11,7 +11,7 @@ jobs:
     name: Python (tests + static)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -31,7 +31,7 @@ jobs:
     name: Rust (cargo test + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -47,7 +47,7 @@ jobs:
     name: Solidity (forge test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Build
         run: cd contracts && forge build
@@ -61,7 +61,7 @@ jobs:
     # only run on pushes to the repo (and manual dispatch).
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Fork tests against pinned Base state
         env:
