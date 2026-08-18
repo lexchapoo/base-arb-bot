@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
-      - uses: crytic/slither-action@v0.4.0
+      - uses: crytic/slither-action@v0.4.2
         with:
           target: contracts/
           slither-config: contracts/slither.config.json
