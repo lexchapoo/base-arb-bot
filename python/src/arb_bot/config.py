@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # the whole verified Base pool set, so the cycle count per trigger is not bounded by
     # config -- this is what keeps a trigger from outliving the opportunity it was priced for.
     route_evaluation_budget_seconds: float = 6.0
+    # After the coarse candidate grid, quote this many extra sizes between the
+    # best size's neighbors (one more batched round) to sharpen the optimum.
+    # 0 disables refinement.
+    size_refinement_points: int = 4
     rust_executor_url: str = "http://localhost:8081"
     quote_timeout_seconds: float = 4.0
     execution_rpc_timeout_seconds: float = 8.0

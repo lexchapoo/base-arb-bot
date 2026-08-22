@@ -78,6 +78,9 @@ class RouteEvaluationRecord(Base):
     flashloan_premium_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     flashloan_premium_units: Mapped[str | None] = mapped_column(String(96), nullable=True)
     deterministic_net_profit_units: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    evaluation_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_disagreement: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    would_submit: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

@@ -6,6 +6,11 @@ _STATEMENTS = [
     "ALTER TABLE pending_pool_events ADD COLUMN IF NOT EXISTS tx_touched_pools_json TEXT NOT NULL DEFAULT '[]'",
     "CREATE INDEX IF NOT EXISTS ix_pending_pool_events_source_sender ON pending_pool_events(source_sender)",
     "ALTER TABLE verified_pools ADD COLUMN IF NOT EXISTS tick_spacing INTEGER",
+    # Present in sql/init.sql since the initial commit; re-added here for databases
+    # created from a schema revision that dropped them.
+    "ALTER TABLE route_evaluations ADD COLUMN IF NOT EXISTS evaluation_latency_ms INTEGER",
+    "ALTER TABLE route_evaluations ADD COLUMN IF NOT EXISTS provider_disagreement BOOLEAN",
+    "ALTER TABLE route_evaluations ADD COLUMN IF NOT EXISTS would_submit BOOLEAN NOT NULL DEFAULT false",
     "ALTER TABLE opportunity_telemetry ADD COLUMN IF NOT EXISTS route_family VARCHAR(66)",
     "ALTER TABLE opportunity_telemetry ADD COLUMN IF NOT EXISTS survival_probability_bps INTEGER",
     "ALTER TABLE opportunity_telemetry ADD COLUMN IF NOT EXISTS route_capture_probability_bps INTEGER",

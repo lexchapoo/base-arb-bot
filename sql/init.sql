@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS route_evaluations (
   flashloan_premium_bps INTEGER,
   flashloan_premium_units VARCHAR(96),
   deterministic_net_profit_units VARCHAR(96),
+  evaluation_latency_ms INTEGER,
+  provider_disagreement BOOLEAN,
+  would_submit BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_route_evaluations_route_id ON route_evaluations(route_id);
