@@ -24,6 +24,9 @@ SLIPSTREAM_QUOTER_ABI = [{
     "type": "function",
 }]
 
+# Output tuple of quoteExactInputSingle, used to decode raw multicall returndata.
+QUOTE_OUTPUT_TYPES = ["uint256", "uint160", "uint32", "uint256"]
+
 
 class SlipstreamQuoter:
     def __init__(self, rpc_url: str, quoter_address: str, venue: str = "aerodrome-slipstream"):
@@ -33,23 +36,48 @@ class SlipstreamQuoter:
         )
         self.venue = venue
 
-    async def quote_exact_input(self, token_in: str, token_out: str, amount_in: int, **kwargs) -> Quote:
-        tick_spacing = kwargs.get("tick_spacing")
+    def _params(self, token_in: str, token_out: str, amount_in: int, tick_spacing) -> tuple:
         if tick_spacing is None:
             raise ValueError("live Slipstream quote requires the discovered pool tick spacing")
-        block_identifier = kwargs.get("block_identifier", "pending")
-        params = (
+        return (
             AsyncWeb3.to_checksum_address(token_in),
             AsyncWeb3.to_checksum_address(token_out),
             amount_in,
             int(tick_spacing),
             0,
         )
+
+    def encode_quote(self, token_in: str, token_out: str, amount_in: int, **kwargs) -> tuple[str, bytes]:
+        """Return (target, calldata) for batching this quote through Multicall3."""
+        params = self._params(token_in, token_out, amount_in, kwargs.get("tick_spacing"))
+        data = self.contract.functions.quoteExactInputSingle(params)._encode_transaction_data()
+        return self.contract.address, bytes.fromhex(data[2:])
+
+    def decode_quote(self, return_data: bytes, token_in: str, token_out: str, amount_in: int, **kwargs) -> Quote:
+        """Decode raw Multicall3 returndata into a Quote (no extra RPC)."""
+        tick_spacing = kwargs.get("tick_spacing")
+        amount_out, sqrt_after, ticks, gas = self.w3.codec.decode(QUOTE_OUTPUT_TYPES, return_data)
+        return Quote(
+            self.venue, token_in, token_out, amount_in, int(amount_out), int(gas), kwargs.get("block_number"),
+            {
+                "tick_spacing": int(tick_spacing) if tick_spacing is not None else None,
+                "ticks_crossed": int(ticks),
+                "sqrt_after": int(sqrt_after),
+                "block_identifier": str(kwargs.get("block_identifier", "pending")),
+            },
+        )
+
+    async def quote_exact_input(self, token_in: str, token_out: str, amount_in: int, **kwargs) -> Quote:
+        tick_spacing = kwargs.get("tick_spacing")
+        block_identifier = kwargs.get("block_identifier", "pending")
+        params = self._params(token_in, token_out, amount_in, tick_spacing)
         amount_out, sqrt_after, ticks, gas = await self.contract.functions.quoteExactInputSingle(
             params
         ).call(block_identifier=block_identifier)
-        latest = await self.w3.eth.get_block(block_identifier)
-        block_number = latest.get("number") if isinstance(latest, dict) else getattr(latest, "number", None)
+        block_number = kwargs.get("block_number")
+        if block_number is None:
+            latest = await self.w3.eth.get_block(block_identifier)
+            block_number = latest.get("number") if isinstance(latest, dict) else getattr(latest, "number", None)
         return Quote(
             self.venue, token_in, token_out, amount_in, int(amount_out), int(gas), block_number,
             {

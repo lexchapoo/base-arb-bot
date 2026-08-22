@@ -78,3 +78,51 @@ def test_slipstream_adapter_absent_until_quoter_is_configured():
 
     if not settings.aerodrome_slipstream_quoter:
         assert registry.get("aerodrome-slipstream") is None
+
+
+def _live_quoter() -> SlipstreamQuoter:
+    """A real SlipstreamQuoter bound to a dummy RPC (no network calls are made)."""
+    return SlipstreamQuoter("http://127.0.0.1:1", addr(0xDEAD), "aerodrome-slipstream")
+
+
+def test_slipstream_encode_quote_targets_the_quoter_and_encodes_tick_spacing():
+    quoter = _live_quoter()
+    target, calldata = quoter.encode_quote(A, B, 1000, tick_spacing=100)
+    assert target == quoter.contract.address
+    # selector + 5 abi words (tokenIn, tokenOut, amountIn, tickSpacing, sqrtPriceLimit)
+    assert len(calldata) == 4 + 32 * 5
+    assert int.from_bytes(calldata[4 + 32 * 3:4 + 32 * 4], "big") == 100
+
+
+def test_slipstream_encode_quote_refuses_missing_tick_spacing():
+    with pytest.raises(ValueError, match="tick spacing"):
+        _live_quoter().encode_quote(A, B, 1000)
+
+
+def test_slipstream_decode_quote_reads_returndata_without_extra_rpc():
+    from eth_abi import encode
+
+    quoter = _live_quoter()
+    return_data = encode(["uint256", "uint160", "uint32", "uint256"], [4321, 99, 3, 55_000])
+    quote = quoter.decode_quote(return_data, A, B, 1000, tick_spacing=100, block_number=42)
+    assert quote.amount_out == 4321
+    assert quote.gas_estimate == 55_000
+    assert quote.block_number == 42
+    assert quote.metadata["tick_spacing"] == 100
+    assert quote.metadata["ticks_crossed"] == 3
+
+
+def test_slipstream_cycle_now_supports_multicall_batching():
+    """Without encode/decode on the adapter the whole cycle silently falls back to serial quoting."""
+    registry = AdapterRegistry.__new__(AdapterRegistry)
+    registry._adapters = {"aerodrome-slipstream": _live_quoter()}
+    optimizer = RouteOptimizer.__new__(RouteOptimizer)
+    optimizer.registry = registry
+
+    class _Cycle:
+        pools = (PoolMetadata.create(
+            address=P, token0=A, token1=B, venue="aerodrome-slipstream",
+            pool_type="cl", tick_spacing=100,
+        ),)
+
+    assert optimizer._cycle_supports_batching(_Cycle()) is True
