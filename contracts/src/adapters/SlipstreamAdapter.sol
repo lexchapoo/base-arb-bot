@@ -3,35 +3,34 @@ pragma solidity ^0.8.24;
 
 import "../interfaces.sol";
 
-interface IUniswapV3RouterLegacy {
+/// Aerodrome Slipstream is a concentrated-liquidity fork of Uniswap V3 whose pool key is
+/// `tickSpacing` (int24) rather than `fee` (uint24). The swap router is otherwise
+/// SwapRouter-shaped, so the calldata differs only in that one field.
+interface ISlipstreamRouter {
     struct ExactInputSingleParams {
-        address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 deadline;
-        uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
     }
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
-interface IUniswapV3Router02 {
-    struct ExactInputSingleParams {
-        address tokenIn; address tokenOut; uint24 fee; address recipient;
-        uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
-    }
-    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
-}
-
-contract UniswapV3Adapter is IExchangeAdapter {
+contract SlipstreamAdapter is IExchangeAdapter {
     error Unauthorized();
     error SwapFailed();
 
     address public immutable executor;
     address public immutable router;
-    bool public immutable router02;
 
-    constructor(address _executor, address _router, bool _router02) {
+    constructor(address _executor, address _router) {
         if (_executor == address(0) || _router == address(0)) revert Unauthorized();
         executor = _executor;
         router = _router;
-        router02 = _router02;
     }
 
     function swap(
@@ -43,37 +42,25 @@ contract UniswapV3Adapter is IExchangeAdapter {
         bytes calldata data
     ) external returns (uint256 amountOut) {
         if (msg.sender != executor) revert Unauthorized();
-        (uint24 fee, uint160 sqrtPriceLimitX96) = abi.decode(data, (uint24, uint160));
+        (int24 tickSpacing, uint160 sqrtPriceLimitX96) = abi.decode(data, (int24, uint160));
         _safeTransferFrom(tokenIn, msg.sender, address(this), amountIn);
         _forceApprove(tokenIn, router, amountIn);
 
+        // Measure the recipient's real delta rather than trusting the router return value,
+        // so fee-on-transfer or rebasing tokens cannot overstate the output.
         uint256 beforeOut = IERC20(tokenOut).balanceOf(recipient);
-        if (router02) {
-            IUniswapV3Router02(router).exactInputSingle(
-                IUniswapV3Router02.ExactInputSingleParams({
-                    tokenIn: tokenIn,
-                    tokenOut: tokenOut,
-                    fee: fee,
-                    recipient: recipient,
-                    amountIn: amountIn,
-                    amountOutMinimum: minOut,
-                    sqrtPriceLimitX96: sqrtPriceLimitX96
-                })
-            );
-        } else {
-            IUniswapV3RouterLegacy(router).exactInputSingle(
-                IUniswapV3RouterLegacy.ExactInputSingleParams({
-                    tokenIn: tokenIn,
-                    tokenOut: tokenOut,
-                    fee: fee,
-                    recipient: recipient,
-                    deadline: block.timestamp,
-                    amountIn: amountIn,
-                    amountOutMinimum: minOut,
-                    sqrtPriceLimitX96: sqrtPriceLimitX96
-                })
-            );
-        }
+        ISlipstreamRouter(router).exactInputSingle(
+            ISlipstreamRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                tickSpacing: tickSpacing,
+                recipient: recipient,
+                deadline: block.timestamp,
+                amountIn: amountIn,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: sqrtPriceLimitX96
+            })
+        );
         uint256 afterOut = IERC20(tokenOut).balanceOf(recipient);
         amountOut = afterOut - beforeOut;
         if (amountOut < minOut) revert SwapFailed();

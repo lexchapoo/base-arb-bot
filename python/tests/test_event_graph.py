@@ -1,8 +1,4 @@
-import json
-
-import pytest
-
-from arb_bot.event_graph import LivePoolGraph, PoolMetadata, load_configured_pools
+from arb_bot.event_graph import LivePoolGraph, PoolMetadata
 
 
 def test_affected_subgraph_only_returns_neighboring_pools():
@@ -35,35 +31,3 @@ def test_unknown_pool_does_not_trigger_global_rescan():
         "affected_tokens": [],
         "affected_pools": [],
     }
-
-
-def test_load_configured_pools_requires_exact_watchlist_match():
-    pool = {
-        "address": "0x0000000000000000000000000000000000000011",
-        "token0": "0x0000000000000000000000000000000000000001",
-        "token1": "0x0000000000000000000000000000000000000002",
-        "venue": "uniswap-v3",
-        "pool_type": "concentrated",
-        "fee": 500,
-    }
-    loaded = load_configured_pools(json.dumps([pool]), pool["address"])
-    assert loaded == [PoolMetadata.create(**pool)]
-
-    with pytest.raises(ValueError, match="differ"):
-        load_configured_pools(
-            json.dumps([pool]),
-            "0x0000000000000000000000000000000000000099",
-        )
-
-
-def test_load_configured_pools_rejects_duplicates():
-    pool = {
-        "address": "0x0000000000000000000000000000000000000011",
-        "token0": "0x0000000000000000000000000000000000000001",
-        "token1": "0x0000000000000000000000000000000000000002",
-        "venue": "aerodrome",
-        "pool_type": "xyk",
-        "stable": False,
-    }
-    with pytest.raises(ValueError, match="duplicate"):
-        load_configured_pools(json.dumps([pool, pool]))

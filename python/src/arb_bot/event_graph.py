@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from threading import RLock
 
@@ -14,6 +13,7 @@ class PoolMetadata:
     pool_type: str
     fee: int | None = None
     stable: bool | None = None
+    tick_spacing: int | None = None
 
     @staticmethod
     def normalize_address(value: str) -> str:
@@ -34,6 +34,7 @@ class PoolMetadata:
         pool_type: str,
         fee: int | None = None,
         stable: bool | None = None,
+        tick_spacing: int | None = None,
     ) -> "PoolMetadata":
         return cls(
             address=cls.normalize_address(address),
@@ -43,6 +44,7 @@ class PoolMetadata:
             pool_type=pool_type.strip().lower(),
             fee=fee,
             stable=stable,
+            tick_spacing=None if tick_spacing is None else int(tick_spacing),
         )
 
 
@@ -182,6 +184,10 @@ class LivePoolGraph:
                             cycles[c.key] = c
         return list(cycles.values())
 
+    def addresses(self) -> list[str]:
+        with self._lock:
+            return sorted(self._pools)
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -200,45 +206,3 @@ class LivePoolGraph:
                     for p in sorted(self._pools.values(), key=lambda x: x.address)
                 ],
             }
-
-
-def load_configured_pools(raw_json: str, watched_addresses: str = "") -> list[PoolMetadata]:
-    """Parse operator-supplied, chain-verified pool metadata and bind it to the watchlist."""
-    if not raw_json.strip():
-        return []
-    parsed = json.loads(raw_json)
-    if not isinstance(parsed, list):
-        raise ValueError("WATCHED_POOLS_JSON must be a JSON array")
-
-    pools: list[PoolMetadata] = []
-    seen: set[str] = set()
-    for item in parsed:
-        if not isinstance(item, dict):
-            raise ValueError("every WATCHED_POOLS_JSON entry must be an object")
-        pool = PoolMetadata.create(
-            address=str(item.get("address", "")),
-            token0=str(item.get("token0", "")),
-            token1=str(item.get("token1", "")),
-            venue=str(item.get("venue", "")),
-            pool_type=str(item.get("pool_type", "")),
-            fee=item.get("fee"),
-            stable=item.get("stable"),
-        )
-        if pool.address in seen:
-            raise ValueError(f"duplicate configured pool: {pool.address}")
-        seen.add(pool.address)
-        pools.append(pool)
-
-    watched = {
-        PoolMetadata.normalize_address(value)
-        for value in watched_addresses.split(",")
-        if value.strip()
-    }
-    if watched and watched != seen:
-        missing_metadata = sorted(watched - seen)
-        unwatched_metadata = sorted(seen - watched)
-        raise ValueError(
-            "WATCHED_POOL_ADDRESSES and WATCHED_POOLS_JSON differ: "
-            f"missing_metadata={missing_metadata}, unwatched_metadata={unwatched_metadata}"
-        )
-    return pools

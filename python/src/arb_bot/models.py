@@ -78,9 +78,20 @@ class PendingLogTrigger(BaseModel):
     transaction_index: int | None = None
     log_index: int | None = None
     observed_at_unix_ms: int
+    state_version: str | None = None
+    state_sequence: int | None = None
     raw_data: str = "0x"
+    source_sender: str | None = None
+    tx_touched_pools: list[str] = Field(default_factory=list)
 
-    @field_validator("pool_address")
+    @field_validator("pool_address", "source_sender")
     @classmethod
-    def valid_pool(cls, value: str) -> str:
+    def valid_pool(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return _address(value)
+
+    @field_validator("tx_touched_pools")
+    @classmethod
+    def valid_touched_pools(cls, values: list[str]) -> list[str]:
+        return sorted({_address(v) for v in values})

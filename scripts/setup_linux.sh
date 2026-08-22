@@ -7,13 +7,10 @@ if command -v uv >/dev/null; then
   cd python
   uv venv --python python3 .venv >/dev/null 2>&1 || true
   uv pip install --python .venv/bin/python -e '.[dev]'
-  cd "$ROOT"
-  uv pip install --python python/.venv/bin/python -e './signer-gateway[dev]'
 else
   python3 -m venv python/.venv
   python/.venv/bin/python -m pip install --upgrade pip
   (cd python && .venv/bin/python -m pip install -e '.[dev]')
-  python/.venv/bin/python -m pip install -e './signer-gateway[dev]'
 fi
 cd "$ROOT"
 [ -f .env ] || cp .env.example .env

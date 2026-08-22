@@ -4,12 +4,7 @@ pragma solidity ^0.8.24;
 import "../interfaces.sol";
 
 interface IAerodromeRouter {
-    struct Route {
-        address from;
-        address to;
-        bool stable;
-        address factory;
-    }
+    struct Route { address from; address to; bool stable; address factory; }
     function swapExactTokensForTokens(
         uint256 amountIn,
         uint256 amountOutMin,

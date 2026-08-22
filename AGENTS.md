@@ -33,3 +33,26 @@ If a tool is missing, report it as NOT RUN; never describe it as passing.
 
 ## Safe default
 Use shadow/dry-run mode and exact pending-state simulation. Never broadcast merely because a private key or signer is configured.
+
+## v0.8 Flashblock/adaptive execution rules
+- Prefer `pendingLogs` for bandwidth-efficient watched-pool triggers. `newFlashblockTransactions` full-data mode is optional and must still filter to `WATCHED_POOL_ADDRESSES` before route evaluation.
+- Never turn an unknown transaction/log into a global graph rescan.
+- Adaptive submission accounting must use integer raw asset units only.
+- Python may pre-gate a batch, but Rust must recompute the adaptive threshold at the final submission boundary.
+- Treat survival window, inclusion probability, expected failure cost, and safety margin as calibration inputs from real observations, not invented market truth.
+- A stale opportunity that exceeds its survival window must be rejected even if deterministic gross/net profit is otherwise positive.
+
+
+## v0.11 State-version rule
+- Never submit a route if its `state_sequence` differs from the Rust watcher current sequence.
+- Critical pending-state simulation must agree across independent RPCs when `RPC_CONSENSUS_REQUIRED=true`.
+- Never fabricate native-token-to-settlement-token conversions for realized PnL; persist exact raw fee and token-delta components instead.
+- Preserve negative/skipped opportunities in telemetry for replay and calibration.
+
+
+## v0.12 Shadow-intelligence rules
+- `NOW / WAIT / SKIP` is shadow-only. It must never construct calldata, reorder packed routes, sign, broadcast, or bypass deterministic gates.
+- Survival calibration and route capture probability must fail closed until `SHADOW_MIN_SAMPLES` real observations exist. Never invent priors and present them as observed probabilities.
+- Competitor/searcher fingerprints may use only observed Flashblock transaction senders and watched-pool footprints. Do not infer an identity when `from` is unavailable.
+- Keep the real deterministic decision and the shadow recommendation side by side for counterfactual evaluation.
+- Do not promote a shadow policy into the execution path without a separate explicit audit/promotion change.

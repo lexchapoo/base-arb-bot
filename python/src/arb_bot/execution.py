@@ -349,6 +349,11 @@ class ContractRuntime:
             if pool.fee is None:
                 raise RuntimeError(f"missing fee for {pool.address}")
             return self.encode(["uint24", "uint160"], [pool.fee, 0])
+        if "slipstream" in venue:
+            # Slipstream's pool key is tickSpacing (int24), not fee.
+            if pool.tick_spacing is None:
+                raise RuntimeError(f"missing tick spacing for {pool.address}")
+            return self.encode(["int24", "uint160"], [int(pool.tick_spacing), 0])
         if "aerodrome" in venue and "slipstream" not in venue:
             if pool.stable is None:
                 raise RuntimeError(f"missing stable flag for {pool.address}")
@@ -555,6 +560,8 @@ class ExecutionFinalizer:
         canonical = self.registry.canonical_venue(pool.venue)
         if canonical == "uniswap-v3":
             return settings.uniswap_v3_adapter_address
+        if canonical == "aerodrome-slipstream":
+            return settings.aerodrome_slipstream_adapter_address
         if canonical == "aerodrome":
             return settings.aerodrome_adapter_address
         raise RuntimeError(f"no execution adapter configured for venue={pool.venue}")
