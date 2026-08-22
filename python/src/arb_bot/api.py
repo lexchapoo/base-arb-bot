@@ -3,9 +3,12 @@ import asyncio
 import json
 import logging
 from decimal import Decimal
+from time import perf_counter
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import select, text
+from . import metrics
 from .config import settings
 from .models import RouteCandidate, ScoreResult, ExecutionEnvelope, PoolRegistration, PendingLogTrigger
 from .scoring import RiskGate
@@ -272,10 +275,12 @@ def _opportunity_id(trigger: PendingLogTrigger, plan) -> str:
 async def route_trigger(trigger: PendingLogTrigger):
     affected=pool_graph.affected_subgraph(trigger.pool_address)
     evaluations=[]
+    evaluation_started=perf_counter()
     if affected["known_pool"]:
         evaluations=await route_optimizer.evaluate_affected(
             affected["affected_pools"], settings.max_route_hops, trigger.block_number
         )
+    evaluation_latency_ms=round((perf_counter()-evaluation_started)*1000)
     # Committed in its own transaction: the observation feed (/intelligence/competitors,
     # survival calibration) must survive a failure in the much larger evaluation insert below.
     try:
@@ -322,6 +327,9 @@ async def route_trigger(trigger: PendingLogTrigger):
                     flashloan_premium_bps=result.execution.get("flashloan_premium_bps") if result.execution else None,
                     flashloan_premium_units=str(result.execution.get("flashloan_premium_units")) if result.execution and result.execution.get("flashloan_premium_units") is not None else None,
                     deterministic_net_profit_units=str(result.execution.get("deterministic_net_profit_units")) if result.execution and result.execution.get("deterministic_net_profit_units") is not None else None,
+                    evaluation_latency_ms=evaluation_latency_ms,
+                    provider_disagreement=None,
+                    would_submit=result.submission_eligible,
                 ))
             await db.commit()
     except Exception:
@@ -455,17 +463,33 @@ async def route_trigger(trigger: PendingLogTrigger):
                 except Exception as exc:
                     auto_submissions.append({"route_id":result.route_id,"accepted":False,"error":type(exc).__name__})
 
+    submission_candidates=sum(1 for result in evaluations if result.submission_eligible)
+    metrics.inc("arb_route_triggers_total")
+    metrics.inc("arb_route_triggers_known_pool_total" if affected["known_pool"] else "arb_route_triggers_unknown_pool_total")
+    metrics.inc("arb_route_evaluations_total", len(evaluations))
+    metrics.inc("arb_route_submission_eligible_total", submission_candidates)
+    metrics.observe_latency_ms(evaluation_latency_ms)
+
     return {
         "triggered":bool(affected["known_pool"]),
         "reason":"route_optimizer_evaluated" if affected["known_pool"] else "pool_not_registered",
         **affected,
         "route_evaluations":[result.to_dict() for result in evaluations],
-        "submission_candidates":sum(1 for result in evaluations if result.submission_eligible),
+        "submission_candidates":submission_candidates,
         "packed_batch_plan":packed_batch_plan.to_dict() if packed_batch_plan else None,
         "auto_submissions":auto_submissions,
         "state_version":trigger.state_version,
         "state_sequence":trigger.state_sequence,
     }
+
+@app.get("/metrics")
+def prometheus_metrics() -> PlainTextResponse:
+    graph = pool_graph.snapshot()
+    gauges = {
+        "arb_dry_run": 1 if settings.dry_run else 0,
+        "arb_registered_pools": graph["pool_count"],
+    }
+    return PlainTextResponse(metrics.render(gauges))
 
 @app.post("/score", response_model=ScoreResult)
 async def score(candidate: RouteCandidate):
