@@ -115,6 +115,12 @@ class RouteOptimizer:
         self.registry = registry or AdapterRegistry()
         self.balance_provider = balance_provider
         self.max_quote_evaluations = max_quote_evaluations or settings.max_quote_evaluations
+        # Bounds how many quote/cycle coroutines hit the RPC at once when
+        # evaluation fans out with asyncio.gather. Created without a running
+        # loop (safe on 3.10+, which no longer binds the semaphore to a loop
+        # at construction) and shared across requests as a global throttle.
+        self._quote_semaphore = asyncio.Semaphore(max(1, settings.quote_concurrency))
+        self._multicall_client = None
         self.execution_finalizer = execution_finalizer
         if self.execution_finalizer is None and enable_execution_finalizer:
             self.execution_finalizer = ExecutionFinalizer(graph, self.registry)
@@ -163,45 +169,239 @@ class RouteOptimizer:
             values.add(max(1, x))
         return sorted(values)
 
-    async def _optimize_size(self, cycle: Cycle) -> tuple[int | None, int | None, list[Quote], list[str]]:
+    @staticmethod
+    def _refine_amounts(grid: list[int], best_amount: int, points: int) -> list[int]:
+        """Sizes strictly between the best candidate's neighbours in the grid.
+
+        Used for one extra batched quote round to sharpen the optimal size.
+        Deterministic and integer-only.
+        """
+        ordered = sorted(set(grid))
+        if points <= 0 or best_amount not in ordered:
+            return []
+        idx = ordered.index(best_amount)
+        lo = ordered[idx - 1] if idx > 0 else max(1, best_amount // 2)
+        hi = ordered[idx + 1] if idx + 1 < len(ordered) else best_amount
+        if hi <= lo:
+            return []
+        span = hi - lo
+        out: set[int] = set()
+        for k in range(1, points + 1):
+            candidate = lo + span * k // (points + 1)
+            if candidate > 0 and candidate != best_amount:
+                out.add(candidate)
+        return sorted(out)
+
+    @staticmethod
+    def _dedup_cycles(cycles: list[Cycle]) -> list[Cycle]:
+        """Collapse rotations of the same directed ring.
+
+        A ring A->B->C->A is enumerated once per entry point (3x for 3-hop,
+        2x for 2-hop). Those rotations are the same trade, so we keep one
+        representative per rotation-invariant signature. Direction is
+        preserved: the reverse ring is a different trade and is kept.
+        """
+        seen: set[tuple] = set()
+        out: list[Cycle] = []
+        for cycle in cycles:
+            edges = tuple(
+                (cycle.pools[i].address, cycle.tokens[i], cycle.tokens[i + 1])
+                for i in range(len(cycle.pools))
+            )
+            canonical = min(edges[i:] + edges[:i] for i in range(len(edges))) if edges else edges
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            out.append(cycle)
+        return out
+
+    async def _prefetch_balances(self, cycles: list[Cycle]) -> dict[tuple[str, str], int]:
+        """Batch every distinct (first-hop token, first pool) balanceOf via Multicall3."""
+        if not cycles or not self._cycle_supports_batching(cycles[0]):
+            return {}
+        pairs = list({(cycle.tokens[0], cycle.pools[0].address) for cycle in cycles})
+        calls: list[tuple[str, bytes]] = []
+        for token, pool in pairs:
+            account = pool.lower().removeprefix("0x").rjust(64, "0")
+            calls.append((token, bytes.fromhex("70a08231" + account)))  # balanceOf(address)
+        try:
+            results = await self._multicall().aggregate3(calls, "pending")
+        except Exception:
+            return {}
+        balances: dict[tuple[str, str], int] = {}
+        for (token, pool), (ok, return_data) in zip(pairs, results):
+            if ok and len(return_data) >= 32:
+                balances[(token, pool)] = int.from_bytes(return_data[:32], "big")
+        return balances
+
+    def _cycle_supports_batching(self, cycle: Cycle) -> bool:
+        """True only when every pool's adapter can encode/decode raw calldata."""
+        for pool in cycle.pools:
+            adapter = self.registry.get(pool.venue)
+            if adapter is None or not hasattr(adapter, "encode_quote") or not hasattr(adapter, "decode_quote"):
+                return False
+        return True
+
+    def _multicall(self) -> "MulticallClient":
+        if self._multicall_client is None:
+            from .multicall import MulticallClient
+            self._multicall_client = MulticallClient(settings.base_http_rpc)
+        return self._multicall_client
+
+    async def _batched_quotes(
+        self, cycle: Cycle, amounts: list[int], observed_block: int | None
+    ) -> tuple[dict[int, tuple[int, list[Quote]]], list[str]]:
+        """Quote every candidate size using one Multicall3 request per hop.
+
+        Quotes are dependent along a cycle (hop N+1 input is hop N output) but
+        independent across candidate sizes, so we batch the size dimension at
+        each hop: C candidates x H hops collapses from C*H round-trips to H.
+        """
+        blockers: list[str] = []
+        mc = self._multicall()
+        quotes_by_index: dict[int, list[Quote]] = {i: [] for i in range(len(amounts))}
+        current: dict[int, int] = {i: amounts[i] for i in range(len(amounts))}
+        surviving = list(range(len(amounts)))
+        for hop, pool in enumerate(cycle.pools):
+            adapter = self.registry.get(pool.venue)
+            kwargs = self._pool_kwargs(pool)
+            token_in = cycle.tokens[hop]
+            token_out = cycle.tokens[hop + 1]
+            calls = [adapter.encode_quote(token_in, token_out, current[i], **kwargs) for i in surviving]
+            try:
+                results = await mc.aggregate3(calls, block_identifier=kwargs.get("block_identifier", "pending"))
+            except Exception as exc:
+                return {}, [f"multicall_failed:{type(exc).__name__}"]
+            next_surviving: list[int] = []
+            for i, (ok, return_data) in zip(surviving, results):
+                if not ok or len(return_data) == 0:
+                    blockers.append("quote_failed:ContractLogicError")
+                    continue
+                try:
+                    quote = adapter.decode_quote(
+                        return_data, token_in, token_out, current[i], block_number=observed_block, **kwargs
+                    )
+                except Exception as exc:
+                    blockers.append(f"quote_decode_failed:{type(exc).__name__}")
+                    continue
+                quotes_by_index[i].append(quote)
+                current[i] = quote.amount_out
+                next_surviving.append(i)
+            surviving = next_surviving
+            if not surviving:
+                break
+
+        quoted: dict[int, tuple[int, list[Quote]]] = {}
+        for i in surviving:
+            if len(quotes_by_index[i]) == len(cycle.pools):
+                quoted[amounts[i]] = (current[i], quotes_by_index[i])
+        return quoted, blockers
+
+    async def _parallel_quotes(
+        self, cycle: Cycle, amounts: list[int]
+    ) -> tuple[dict[int, tuple[int, list[Quote]]], list[str]]:
+        """Fallback path for adapters without multicall support (e.g. test fakes).
+
+        Quotes each candidate concurrently, bounded by the shared semaphore.
+        """
+        blockers: list[str] = []
+
+        async def _quote_size(amount: int) -> tuple[int, int, list[Quote]]:
+            async with self._quote_semaphore:
+                out, quotes = await self._quote_cycle(cycle, amount)
+            return amount, out, quotes
+
+        settled = await asyncio.gather(
+            *(_quote_size(amount) for amount in amounts), return_exceptions=True
+        )
+        quoted: dict[int, tuple[int, list[Quote]]] = {}
+        for item in settled:
+            if isinstance(item, BaseException):
+                blockers.append(f"quote_failed:{type(item).__name__}")
+                continue
+            amount, out, quotes = item
+            quoted[amount] = (out, quotes)
+        return quoted, blockers
+
+    async def _optimize_size(
+        self,
+        cycle: Cycle,
+        observed_block: int | None = None,
+        balance_map: dict[tuple[str, str], int] | None = None,
+    ) -> tuple[int | None, int | None, list[Quote], list[str]]:
         blockers: list[str] = []
         token_in = cycle.tokens[0]
         first_pool = cycle.pools[0]
-        try:
-            if self.balance_provider is None:
-                self.balance_provider = LiveBalanceProvider(settings.base_http_rpc)
-            upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
-        except Exception as exc:
-            return None, None, [], [f"live_balance_query_failed:{type(exc).__name__}"]
+        upper = balance_map.get((token_in, first_pool.address)) if balance_map else None
+        if upper is None:
+            # Not prefetched (or batching unavailable): fall back to a live query.
+            try:
+                if self.balance_provider is None:
+                    self.balance_provider = LiveBalanceProvider(settings.base_http_rpc)
+                upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
+            except Exception as exc:
+                return None, None, [], [f"live_balance_query_failed:{type(exc).__name__}"]
         if upper <= 0:
             return None, None, [], ["first_pool_has_zero_pending_token_balance"]
 
-        best_amount: int | None = None
-        best_out: int | None = None
-        best_profit: int | None = None
-        for amount in self._candidate_amounts(upper):
-            try:
-                out, _quotes = await self._quote_cycle(cycle, amount)
-            except Exception as exc:
-                blockers.append(f"quote_failed:{type(exc).__name__}")
-                continue
-            profit = out - amount
-            if best_profit is None or profit > best_profit:
-                best_amount, best_out, best_profit = amount, out, profit
+        amounts = self._candidate_amounts(upper)
+        batched = self._cycle_supports_batching(cycle)
+        if batched:
+            quoted, quote_blockers = await self._batched_quotes(cycle, amounts, observed_block)
+        else:
+            quoted, quote_blockers = await self._parallel_quotes(cycle, amounts)
+        blockers.extend(quote_blockers)
+
+        def _pick_best(candidates: dict[int, tuple[int, list[Quote]]]) -> tuple[int | None, int | None]:
+            # Iterate in deterministic ascending order; strict `>` keeps the
+            # smallest size on a profit tie, matching pre-batch behaviour.
+            b_amount: int | None = None
+            b_out: int | None = None
+            b_profit: int | None = None
+            for amount in sorted(candidates):
+                out, _quotes = candidates[amount]
+                profit = out - amount
+                if b_profit is None or profit > b_profit:
+                    b_amount, b_out, b_profit = amount, out, profit
+            return b_amount, b_out
+
+        best_amount, best_out = _pick_best(quoted)
+
+        # Second batched round: sharpen the optimum by quoting sizes between the
+        # best candidate's neighbours. Stays fully batched and deterministic.
+        if batched and best_amount is not None and settings.size_refinement_points > 0:
+            refined = self._refine_amounts(amounts, best_amount, settings.size_refinement_points)
+            if refined:
+                extra, refine_blockers = await self._batched_quotes(cycle, refined, observed_block)
+                blockers.extend(refine_blockers)
+                quoted.update(extra)
+                best_amount, best_out = _pick_best(quoted)
 
         if best_amount is None or best_out is None:
             if not blockers:
                 blockers.append("no_live_quotes_returned")
             return None, None, [], sorted(set(blockers))
 
-        # Re-quote selected size immediately against Base pending state.
-        try:
-            final_out, final_quotes = await self._quote_cycle(cycle, best_amount)
-        except Exception as exc:
-            return None, None, [], [f"pending_resimulation_failed:{type(exc).__name__}"]
+        # Re-quote the selected size immediately against Base pending state.
+        if batched:
+            requoted, requote_blockers = await self._batched_quotes(cycle, [best_amount], observed_block)
+            item = requoted.get(best_amount)
+            if item is None:
+                return None, None, [], sorted(set(blockers + requote_blockers + ["pending_resimulation_failed"]))
+            final_out, final_quotes = item
+        else:
+            try:
+                final_out, final_quotes = await self._quote_cycle(cycle, best_amount)
+            except Exception as exc:
+                return None, None, [], [f"pending_resimulation_failed:{type(exc).__name__}"]
         return best_amount, final_out, final_quotes, sorted(set(blockers))
 
-    async def evaluate_cycle(self, cycle: Cycle, observed_block: int | None = None) -> RouteEvaluation:
+    async def evaluate_cycle(
+        self,
+        cycle: Cycle,
+        observed_block: int | None = None,
+        balance_map: dict[tuple[str, str], int] | None = None,
+    ) -> RouteEvaluation:
         route_id = self._route_id(cycle)
         blockers: list[str] = []
         for pool in cycle.pools:
@@ -217,7 +417,7 @@ class RouteOptimizer:
         if blockers:
             return RouteEvaluation(route_id, tuple(p.address for p in cycle.pools), cycle.tokens, None, None, None, tuple(), None, False, False, tuple(sorted(set(blockers))), tuple(), {})
 
-        amount_in, amount_out, quotes, size_blockers = await self._optimize_size(cycle)
+        amount_in, amount_out, quotes, size_blockers = await self._optimize_size(cycle, observed_block, balance_map)
         blockers.extend(size_blockers)
         if amount_in is None or amount_out is None:
             return RouteEvaluation(route_id, tuple(p.address for p in cycle.pools), cycle.tokens, None, None, None, tuple(), None, False, False, tuple(sorted(set(blockers))), tuple(), {})
@@ -266,46 +466,33 @@ class RouteOptimizer:
             execution=execution,
         )
 
-    def _skipped(self, cycle: Cycle, blocker: str) -> RouteEvaluation:
-        return RouteEvaluation(
-            route_id=self._route_id(cycle),
-            pools=tuple(p.address for p in cycle.pools),
-            tokens=cycle.tokens,
-            amount_in=None,
-            amount_out=None,
-            gross_profit_units=None,
-            quote_block_numbers=tuple(),
-            quote_gas_units=None,
-            ev_ready=False,
-            submission_eligible=False,
-            blockers=(blocker,),
-            quote_metadata=tuple(),
-            execution={},
-        )
-
-    @staticmethod
-    def _dedup_cycles(cycles: list[Cycle]) -> list[Cycle]:
-        """Collapse rotations of the same directed ring.
-
-        A ring A->B->C->A is enumerated once per entry point (3x for 3-hop, 2x for 2-hop).
-        Those rotations are the same trade, so quoting and packing them all burns the
-        evaluation budget on duplicates and puts the same trade into a packed batch several
-        times. Keep one representative per rotation-invariant signature. Direction is
-        preserved: the reverse ring is a different trade and is kept.
-        """
-        seen: set[tuple] = set()
-        out: list[Cycle] = []
-        for cycle in cycles:
-            edges = tuple(
-                (cycle.pools[i].address, cycle.tokens[i], cycle.tokens[i + 1])
-                for i in range(len(cycle.pools))
+    def reject_affected(
+        self,
+        affected_addresses: list[str],
+        blockers: list[str],
+        max_hops: int | None = None,
+    ) -> list[RouteEvaluation]:
+        """Emit explicit candidates without RPC quoting when a global execution gate is absent."""
+        return [
+            RouteEvaluation(
+                route_id=self._route_id(cycle),
+                pools=tuple(pool.address for pool in cycle.pools),
+                tokens=cycle.tokens,
+                amount_in=None,
+                amount_out=None,
+                gross_profit_units=None,
+                quote_block_numbers=tuple(),
+                quote_gas_units=None,
+                ev_ready=False,
+                submission_eligible=False,
+                blockers=tuple(sorted(set(blockers))),
+                quote_metadata=tuple(),
+                execution={},
             )
-            canonical = min(edges[i:] + edges[:i] for i in range(len(edges))) if edges else edges
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            out.append(cycle)
-        return out
+            for cycle in self.graph.cycles_for_affected(
+                affected_addresses, max_hops or settings.max_route_hops
+            )
+        ]
 
     async def evaluate_affected(
         self,
@@ -313,38 +500,37 @@ class RouteOptimizer:
         max_hops: int | None = None,
         observed_block: int | None = None,
     ) -> list[RouteEvaluation]:
-        """Evaluate every affected cycle under a hard wall-clock budget.
-
-        Automatic pool discovery registers the whole verified Base pool set, so
-        `cycles_for_affected` can return hundreds of cycles. Evaluating them one at a time,
-        each with its own per-cycle timeout, makes the total unbounded -- the caller (and the
-        Rust executor's in-flight trigger slot) would block far past the point where the
-        opportunity is still live. Fan out with bounded concurrency and stop at the deadline.
-        """
-        cycles = self._dedup_cycles(
-            self.graph.cycles_for_affected(affected_addresses, max_hops or settings.max_route_hops)
-        )
-        if not cycles:
-            return []
+        cycles = self.graph.cycles_for_affected(affected_addresses, max_hops or settings.max_route_hops)
+        cycles = self._dedup_cycles(cycles)
         cycle_timeout = settings.quote_timeout_seconds + settings.execution_rpc_timeout_seconds * 6
-        deadline = asyncio.get_running_loop().time() + settings.route_evaluation_budget_seconds
-        semaphore = asyncio.Semaphore(max(1, settings.quote_concurrency))
+        # Fetch every distinct first-hop balance in one Multicall3 request instead
+        # of one live query per cycle (many cycles share a starting pool/token).
+        balance_map = await self._prefetch_balances(cycles)
 
         async def _eval(cycle: Cycle) -> RouteEvaluation:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return self._skipped(cycle, "route_evaluation_budget_exhausted")
             try:
-                async with semaphore:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        return self._skipped(cycle, "route_evaluation_budget_exhausted")
-                    return await asyncio.wait_for(
-                        self.evaluate_cycle(cycle, observed_block),
-                        timeout=min(cycle_timeout, remaining),
-                    )
+                return await asyncio.wait_for(
+                    self.evaluate_cycle(cycle, observed_block, balance_map), timeout=cycle_timeout
+                )
             except asyncio.TimeoutError:
-                return self._skipped(cycle, "route_evaluation_timeout")
+                return RouteEvaluation(
+                    route_id=self._route_id(cycle),
+                    pools=tuple(p.address for p in cycle.pools),
+                    tokens=cycle.tokens,
+                    amount_in=None,
+                    amount_out=None,
+                    gross_profit_units=None,
+                    quote_block_numbers=tuple(),
+                    quote_gas_units=None,
+                    ev_ready=False,
+                    submission_eligible=False,
+                    blockers=("route_evaluation_timeout",),
+                    quote_metadata=tuple(),
+                    execution={},
+                )
 
-        # gather preserves input order, so results line up with `cycles` deterministically.
-        return list(await asyncio.gather(*(_eval(cycle) for cycle in cycles)))
+        # Evaluate cycles concurrently; per-cycle quote fan-out is throttled by
+        # the shared semaphore. gather preserves order so results line up with
+        # `cycles` deterministically.
+        results = await asyncio.gather(*(_eval(cycle) for cycle in cycles))
+        return list(results)
