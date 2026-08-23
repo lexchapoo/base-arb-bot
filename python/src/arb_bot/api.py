@@ -280,11 +280,28 @@ def _opportunity_id(trigger: PendingLogTrigger, plan) -> str:
 async def route_trigger(trigger: PendingLogTrigger):
     affected=pool_graph.affected_subgraph(trigger.pool_address)
     evaluations=[]
+    budget_exceeded=False
     evaluation_started=perf_counter()
     if affected["known_pool"]:
-        evaluations=await route_optimizer.evaluate_affected(
-            affected["affected_pools"], settings.max_route_hops, trigger.block_number
-        )
+        # `route_evaluation_budget_seconds` is a hard wall-clock ceiling on the whole pass. The
+        # per-cycle `asyncio.wait_for` inside the optimizer bounds each cycle individually, but
+        # cycles run concurrently and auto-discovery makes their count unbounded by config, so
+        # without this a single trigger can outlive the opportunity it was priced for. Abandoning
+        # the entire pass (rather than selecting which in-flight cycles to keep) is deliberate:
+        # a partial result would be a biased sample of whichever cycles happened to finish first.
+        try:
+            evaluations=await asyncio.wait_for(
+                route_optimizer.evaluate_affected(
+                    affected["affected_pools"], settings.max_route_hops, trigger.block_number
+                ),
+                timeout=settings.route_evaluation_budget_seconds,
+            )
+        except asyncio.TimeoutError:
+            # Fail closed: no evaluations means no packed batch and no submission. The trigger is
+            # still recorded below so the overrun is visible in telemetry and calibration.
+            budget_exceeded=True
+            evaluations=[]
+            metrics.inc("arb_route_evaluation_budget_exceeded_total")
     evaluation_latency_ms=round((perf_counter()-evaluation_started)*1000)
     # Committed in its own transaction: the observation feed (/intelligence/competitors,
     # survival calibration) must survive a failure in the much larger evaluation insert below.
@@ -477,7 +494,10 @@ async def route_trigger(trigger: PendingLogTrigger):
 
     return {
         "triggered":bool(affected["known_pool"]),
-        "reason":"route_optimizer_evaluated" if affected["known_pool"] else "pool_not_registered",
+        "reason":("route_evaluation_budget_exceeded" if budget_exceeded
+                  else "route_optimizer_evaluated" if affected["known_pool"]
+                  else "pool_not_registered"),
+        "budget_exceeded":budget_exceeded,
         **affected,
         "route_evaluations":[result.to_dict() for result in evaluations],
         "submission_candidates":submission_candidates,

@@ -55,6 +55,13 @@ struct ChainState {
     cached_pool_states: usize,
     #[serde(skip)]
     pool_state_cache: HashMap<String, PoolStateEntry>,
+    /// Calldata hashes already signed and broadcast on the live path. Two Flashblock triggers
+    /// from one swap can reach the same affected subgraph, price the same pending state and
+    /// build a byte-identical packed batch; `validate_state_version` checks only the trigger
+    /// pool's fingerprint, so both pass and both get signed. The second to mine reverts with
+    /// CommitmentAlreadyUsed and burns its full L2 + L1 fee.
+    #[serde(skip)]
+    submitted_batches: SeenLogs,
 }
 
 #[derive(Deserialize)]
@@ -123,10 +130,20 @@ struct PendingLogTrigger {
     tx_touched_pools: Vec<String>,
 }
 
+#[derive(Clone)]
 struct SeenLogs {
     capacity: usize,
     set: HashSet<String>,
     order: VecDeque<String>,
+}
+
+impl Default for SeenLogs {
+    fn default() -> Self {
+        // Bounds the live duplicate-submission guard. Entries are keyed by the exact calldata,
+        // which commits to target_block, so an entry is dead once its target block passes;
+        // 512 covers far more in-flight batches than a single block can contain.
+        Self::new(512)
+    }
 }
 
 impl SeenLogs {
@@ -797,6 +814,26 @@ async fn submit_plan(State(state): State<Arc<RwLock<ChainState>>>, Json(req): Js
         return Err((StatusCode::PRECONDITION_FAILED, "external signer URL/address must be configured and match EXECUTOR_OWNER_ADDRESS".into()));
     }
     let gas_limit = req.gas_limit.ok_or_else(|| (StatusCode::PRECONDITION_FAILED, "gas_limit required for live submission".into()))?;
+
+    // Refuse to sign calldata that has already been signed on this live path. The key is the
+    // exact calldata, which commits to asset, amount, target_block and deadline, so a route
+    // legitimately re-targeted at a later block hashes differently and is still allowed through
+    // -- only a byte-identical resubmission for the same target block is suppressed, and that
+    // one is guaranteed to revert with CommitmentAlreadyUsed.
+    //
+    // Claimed here, before signing, so two concurrent requests cannot both pass the check. If
+    // signing then fails the key stays claimed for the rest of its (one-block) lifetime, giving
+    // up that opportunity rather than reopening the double-submit window. Losing one route is
+    // recoverable; broadcasting two competing transactions is not.
+    {
+        let mut h = Sha256::new();
+        h.update(req.calldata.to_lowercase().as_bytes());
+        let batch_key = hex::encode(h.finalize());
+        if !state.write().await.submitted_batches.insert_if_new(batch_key) {
+            return Err((StatusCode::CONFLICT, "identical packed batch already signed for this target block".into()));
+        }
+    }
+
     validate_state_version(&*state.read().await, &req).map_err(|e| (StatusCode::GONE, e))?;
     let asset_balance_before = erc20_balance(&rpc, &req.asset, &executor, "pending").await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("pre-submit asset balance failed: {e}")))?;
@@ -1434,4 +1471,55 @@ mod adaptive_tests {
         fs::remove_file(path).unwrap();
     }
 
+
+    /// Two Flashblock triggers from one swap can build a byte-identical packed batch; both pass
+    /// `validate_state_version` because each carries its own trigger pool. Without a guard both
+    /// get signed and the loser reverts with CommitmentAlreadyUsed, burning its full fee.
+    #[test]
+    fn identical_live_calldata_is_only_admitted_once() {
+        let mut state = ChainState::default();
+        let calldata = "0xdeadbeef0000000000000000000000000000000000000000000000000000000001";
+
+        let key = |data: &str| {
+            let mut h = Sha256::new();
+            h.update(data.to_lowercase().as_bytes());
+            hex::encode(h.finalize())
+        };
+
+        assert!(state.submitted_batches.insert_if_new(key(calldata)), "first submission must pass");
+        assert!(!state.submitted_batches.insert_if_new(key(calldata)), "identical resubmission must be suppressed");
+        // Case differences in the hex payload must not defeat the guard.
+        assert!(!state.submitted_batches.insert_if_new(key(&calldata.to_uppercase())));
+    }
+
+    /// The key is the exact calldata, which commits to target_block -- so a route legitimately
+    /// re-targeted at a later block must still be admitted. Suppressing that would silently
+    /// drop valid retries rather than duplicates.
+    #[test]
+    fn a_batch_retargeted_at_a_later_block_is_still_admitted() {
+        let mut state = ChainState::default();
+        let key = |data: &str| {
+            let mut h = Sha256::new();
+            h.update(data.to_lowercase().as_bytes());
+            hex::encode(h.finalize())
+        };
+
+        let at_block_1 = "0xdeadbeef0000000000000000000000000000000000000000000000000000000001";
+        let at_block_2 = "0xdeadbeef0000000000000000000000000000000000000000000000000000000002";
+
+        assert!(state.submitted_batches.insert_if_new(key(at_block_1)));
+        assert!(state.submitted_batches.insert_if_new(key(at_block_2)), "a different target block is a different batch");
+    }
+
+    /// The guard is bounded, so a long-running executor cannot grow it without limit.
+    #[test]
+    fn submitted_batch_guard_evicts_oldest_beyond_capacity() {
+        let mut guard = SeenLogs::default();
+        for i in 0..600 {
+            assert!(guard.insert_if_new(format!("key-{i}")));
+        }
+        assert!(guard.set.len() <= 512, "guard must stay bounded");
+        // The oldest key has been evicted, so it would be admitted again.
+        assert!(guard.insert_if_new("key-0".to_string()));
+    }
 }
