@@ -59,6 +59,19 @@ def call_data(signature: str, types: list[str], values: list[Any]) -> str:
     return "0x" + (selector + encode(types, values)).hex()
 
 
+def emit(plan: dict[str, Any], output: Path | None) -> None:
+    serialized = json.dumps(plan, indent=2) + "\n"
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # "x" mode: never silently overwrite a plan a signer may already be pinned to.
+        with output.open("x", encoding="utf-8") as handle:
+            handle.write(serialized)
+        output.chmod(0o600)
+        print(json.dumps({"plan_path": str(output), "transactions": len(plan["transactions"])}))
+    else:
+        print(serialized, end="")
+
+
 def transaction(nonce: int, purpose: str, to: str | None, data: bytes | str) -> dict[str, Any]:
     encoded = "0x" + data.hex() if isinstance(data, bytes) else data
     return {"nonce": nonce, "purpose": purpose, "to": to, "value": "0x0", "data": encoded}
@@ -70,6 +83,14 @@ def main() -> int:
     parser.add_argument("--owner", default=os.environ.get("EXECUTOR_OWNER_ADDRESS", ""))
     parser.add_argument("--nonce", required=True, type=int, help="pending nonce of the deployment signer")
     parser.add_argument("--output", type=Path, help="write the reviewed plan to a new 0600 file")
+    parser.add_argument(
+        "--executor", default="",
+        help="address of an ALREADY-DEPLOYED executor. Emits ONLY the adapter/token allowlist "
+             "calls against it, so every transaction targets live code and estimates correctly. "
+             "Requires --aerodrome-adapter and --uniswap-v3-adapter.",
+    )
+    parser.add_argument("--aerodrome-adapter", default="", help="deployed AerodromeAdapter address")
+    parser.add_argument("--uniswap-v3-adapter", default="", help="deployed UniswapV3Adapter address")
     parser.add_argument(
         "--implementation", default="",
         help="address of an ALREADY-DEPLOYED BaseArbExecutorUpgradeable implementation. Use for "
@@ -107,6 +128,54 @@ def main() -> int:
 
     if args.implementation and not args.upgradeable:
         raise SystemExit("--implementation requires --upgradeable")
+
+    if args.executor:
+        # Allowlist-only plan. The executor and both adapters already exist on-chain, so nothing
+        # here depends on a contract created later in the same plan -- the failure mode where a
+        # call to a not-yet-deployed address estimates at ~22k instead of its real ~55k.
+        if not (args.aerodrome_adapter and args.uniswap_v3_adapter):
+            raise SystemExit("--executor requires --aerodrome-adapter and --uniswap-v3-adapter")
+        executor = address(args.executor, "--executor")
+        aero_adapter = address(args.aerodrome_adapter, "--aerodrome-adapter")
+        uni_adapter = address(args.uniswap_v3_adapter, "--uniswap-v3-adapter")
+        nonce = args.nonce
+        transactions = [
+            transaction(nonce, "allow AerodromeAdapter", executor,
+                        call_data("setAdapter(address,bool)", ["address", "bool"], [aero_adapter, True])),
+            transaction(nonce + 1, "allow UniswapV3Adapter", executor,
+                        call_data("setAdapter(address,bool)", ["address", "bool"], [uni_adapter, True])),
+        ]
+        nonce += 2
+        for token in allowed_tokens:
+            transactions.append(
+                transaction(nonce, f"allow token {token}", executor,
+                            call_data("setToken(address,bool)", ["address", "bool"], [token, True]))
+            )
+            nonce += 1
+        plan = {
+            "chain_id": 8453,
+            "broadcast": False,
+            "activation_state": "paused",
+            "admin_only": True,
+            "deployer": deployer,
+            "intended_owner": owner,
+            "starting_nonce": args.nonce,
+            "predicted_addresses": {
+                "executor": executor,
+                "aerodrome_adapter": aero_adapter,
+                "uniswap_v3_adapter": uni_adapter,
+            },
+            "init_code_hashes": {},
+            "transactions": transactions,
+            "postconditions": [
+                "verify executor.paused() is true",
+                "verify every adapter and token in this plan reads back as allowed on-chain",
+                "this plan deploys nothing; it only mutates the allowlist of an existing executor",
+                "do not call setPaused(false) before the shadow and canary gates pass",
+            ],
+        }
+        emit(plan, args.output)
+        return 0
 
     if args.upgradeable and args.implementation:
         # Phase 2: the implementation is already on-chain, so this plan begins at the proxy.
@@ -150,6 +219,7 @@ def main() -> int:
         ]
     else:
         implementation = None
+        implementation_init = None
         executor = create_address(deployer, args.nonce)
         aero_adapter = create_address(deployer, args.nonce + 1)
         uni_adapter = create_address(deployer, args.nonce + 2)
@@ -217,15 +287,7 @@ def main() -> int:
             "do not call setPaused(false) before the shadow and canary gates pass",
         ],
     }
-    serialized = json.dumps(plan, indent=2) + "\n"
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("x", encoding="utf-8") as handle:
-            handle.write(serialized)
-        args.output.chmod(0o600)
-        print(json.dumps({"plan_path": str(args.output), "transactions": len(transactions)}))
-    else:
-        print(serialized, end="")
+    emit(plan, args.output)
     return 0
 
 

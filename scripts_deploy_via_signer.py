@@ -261,6 +261,22 @@ def main() -> int:
         }
         if transaction.get("to"):
             tx["to"] = transaction["to"]
+        # A call to an address with no code does not revert -- it succeeds for ~22k gas and
+        # returns a confident, meaningless estimate. That is how a plan whose admin calls target
+        # a proxy created earlier in the same plan gets gas limits less than half what the real
+        # calls need, failing on-chain only after the money is spent. Estimation cannot detect
+        # this, so check for code explicitly.
+        if transaction.get("to"):
+            if rpc(rpc_url, "eth_getCode", [transaction["to"], "pending"]) in ("0x", "0x0"):
+                if int(transaction["nonce"]) == pending_nonce:
+                    raise SystemExit(
+                        f"transaction {transaction['nonce']} ({transaction['purpose']}) targets "
+                        f"{transaction['to']}, which has no code. Any estimate for it would be "
+                        f"meaningless. Deploy that contract first, then generate a plan for these "
+                        f"calls against the deployed address."
+                    )
+                partial_after = int(transaction["nonce"])
+                break
         try:
             estimated = hex_int(rpc(rpc_url, "eth_estimateGas", [tx, "pending"]))
         except RuntimeError as exc:
