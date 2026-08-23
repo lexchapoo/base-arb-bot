@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import logging
 from decimal import Decimal
@@ -264,11 +265,15 @@ def _opportunity_id(trigger: PendingLogTrigger, plan) -> str:
     """Stable, collision-free identity for one observed opportunity.
 
     The Rust executor echoes this back as `route_id` on /telemetry/reconcile, so whatever is
-    sent as the submission `route_id` must be exactly this value.
+    sent as the submission `route_id` must be exactly this value. It is also forwarded verbatim
+    to the external signer, whose policy accepts only a 32-byte hex `route_id`, and it is stored
+    in a VARCHAR(96) column -- so this must be a fixed 32-byte commitment, not a concatenation of
+    the batch hash and the state fingerprint (which is 133 characters and satisfies neither).
     """
     discriminator = trigger.state_version or str(trigger.state_sequence or trigger.observed_at_unix_ms)
     batch_hash = plan.batch_hash if plan is not None else None
-    return f"{batch_hash}:{discriminator}" if batch_hash else f"state:{discriminator}"
+    preimage = f"{batch_hash}:{discriminator}" if batch_hash else f"state:{discriminator}"
+    return "0x" + hashlib.sha256(preimage.encode()).hexdigest()
 
 
 @app.post("/route-trigger")
@@ -380,7 +385,7 @@ async def route_trigger(trigger: PendingLogTrigger):
             payload={
                 "route_id":opportunity_id,
                 "calldata":packed_batch_plan.calldata,
-                "gas_limit":packed_batch_plan.estimate_gas_units or packed_batch_plan.simulation_gas_units,
+                "gas_limit":max((v for v in (packed_batch_plan.estimate_gas_units, packed_batch_plan.simulation_gas_units) if v is not None), default=None),
                 "deterministic_net_profit_units":str(packed_batch_plan.deterministic_net_profit_units),
                 "asset":packed_batch_plan.asset,
                 "target_block":packed_batch_plan.target_block,

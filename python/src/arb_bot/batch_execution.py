@@ -156,7 +156,13 @@ class PackedBatchFinalizer:
                     tuple(r.route_id for r in rows), True, sim.gas_used, estimate,
                     gas_asset, conservative_net, eligible, adaptive, tuple(blockers),
                 )
-            blockers.append(f"trimmed_low_ev_candidate:{rows[-1].route_id}")
-            rows = rows[:-1]
+            # `conservative_net` is bound by the *smallest* `min_profit` in the menu, because the
+            # contract enforces only the selected candidate's floor. `rows` is ordered by each
+            # route's own post-gas EV, which is a different ordering (per-route gas differs while
+            # the packed transaction has a single shared cost), so dropping the tail can leave the
+            # binding candidate in place and discard a menu that was profitable without it.
+            trimmed = min(rows, key=lambda r: (int(r.execution["packed_candidate"]["min_profit"]), r.route_id))
+            blockers.append(f"trimmed_low_ev_candidate:{trimmed.route_id}")
+            rows = [r for r in rows if r.route_id != trimmed.route_id]
 
         return PackedBatchPlan(None, None, None, None, None, (), False, None, None, None, None, False, None, tuple(blockers + ["no_profitable_packed_batch_after_exact_costs"]))

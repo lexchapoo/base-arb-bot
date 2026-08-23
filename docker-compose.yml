@@ -30,9 +30,9 @@ services:
   rust-executor:
     build: ./rust-executor
     env_file: .env
-    ports: ["8081:8081"]
+    ports: ["8085:8085"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8085/health"]
       interval: 10s
       timeout: 5s
       retries: 6

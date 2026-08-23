@@ -728,7 +728,12 @@ async fn submit_plan(State(state): State<Arc<RwLock<ChainState>>>, Json(req): Js
     if let Some(target) = req.target_block {
         if let Ok(body) = rpc_call(&rpc, "eth_blockNumber", serde_json::json!([])).await {
             if let Ok(latest) = rpc_hex_u128(&body) {
-                if latest > target as u128 {
+                // A transaction sent while `eth_blockNumber == latest` can be included no
+                // earlier than `latest + 1`, so it can satisfy the executor's
+                // `block.number <= targetBlock` only when `latest < target`. Rejecting only a
+                // strictly-past target let an unsatisfiable `latest == target` through to the
+                // exact pending-state simulation instead of failing here.
+                if latest >= target as u128 {
                     return Err((StatusCode::GONE, "route target block already passed".into()));
                 }
             }

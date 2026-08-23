@@ -60,6 +60,9 @@ AAVE_POOL_ABI = [
         "type": "function",
     },
     {
+        # Aave v3 `IPool.getReserveData` returns `ReserveDataLegacy` (15 static fields), not the
+        # extended struct exposed by `getReserveDataExtended`. Verified against the deployed Base
+        # mainnet Pool, which returns exactly 480 bytes (15 words) for this call.
         "inputs": [{"name": "asset", "type": "address"}],
         "name": "getReserveData",
         "outputs": [
@@ -73,7 +76,6 @@ AAVE_POOL_ABI = [
                     {"name": "__deprecatedStableBorrowRate", "type": "uint128"},
                     {"name": "lastUpdateTimestamp", "type": "uint40"},
                     {"name": "id", "type": "uint16"},
-                    {"name": "liquidationGracePeriodUntil", "type": "uint40"},
                     {"name": "aTokenAddress", "type": "address"},
                     {"name": "__deprecatedStableDebtTokenAddress", "type": "address"},
                     {"name": "variableDebtTokenAddress", "type": "address"},
@@ -81,7 +83,6 @@ AAVE_POOL_ABI = [
                     {"name": "accruedToTreasury", "type": "uint128"},
                     {"name": "unbacked", "type": "uint128"},
                     {"name": "isolationModeTotalDebt", "type": "uint128"},
-                    {"name": "virtualUnderlyingBalance", "type": "uint128"},
                 ],
                 "name": "",
                 "type": "tuple",
@@ -334,7 +335,8 @@ class ContractRuntime:
         reserve = await p.functions.getReserveData(self.checksum(asset)).call(block_identifier="pending")
         configuration = reserve[0][0] if isinstance(reserve[0], (tuple, list)) else reserve[0]
         flashloan_enabled = bool((int(configuration) >> 63) & 1)
-        a_token = self.checksum(reserve[9])
+        # ReserveDataLegacy index 8 is `aTokenAddress`; index 9 is the deprecated stable debt token.
+        a_token = self.checksum(reserve[8])
         token = self.w3.eth.contract(address=self.checksum(asset), abi=ERC20_ABI)
         available = int(await token.functions.balanceOf(a_token).call(block_identifier="pending"))
         return AaveSnapshot(premium, available, flashloan_enabled, a_token)

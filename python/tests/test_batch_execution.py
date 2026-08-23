@@ -87,3 +87,23 @@ async def test_packed_batch_adaptive_gate_rejects_stale_trigger(monkeypatch):
     assert plan.submission_eligible is False
     assert plan.adaptive_submission["survival_probability_bps"] == 0
     assert "adaptive_expected_capture_below_threshold" in plan.blockers
+
+
+@pytest.mark.asyncio
+async def test_trim_drops_the_binding_min_profit_not_the_tail(monkeypatch):
+    """The menu floor is min(min_profit); trimming must remove that candidate.
+
+    r_low ranks first on its own post-gas EV (its route-level gas was small) but carries the
+    lowest on-chain profit floor. Trimming the tail would drop r_high and then r_low, reporting
+    no profitable batch -- even though the r_high-only menu clears the exact packed gas cost.
+    """
+    monkeypatch.setattr(settings, "executor_address", EXEC)
+    monkeypatch.setattr(settings, "executor_owner_address", OWNER)
+    monkeypatch.setattr(settings, "adaptive_submission_enabled", False)
+    plan = await PackedBatchFinalizer(Finalizer()).finalize(
+        [row("r_low", 1000, 800, 200), row("r_high", 1000, 400, 900)]
+    )
+    assert plan.submission_eligible is True
+    assert plan.candidate_route_ids == ("r_high",)
+    assert plan.deterministic_net_profit_units == 650  # 900 - 250 exact packed gas
+    assert any(x.startswith("trimmed_low_ev_candidate:r_low") for x in plan.blockers)

@@ -96,3 +96,49 @@ async def test_finalizer_blocks_insufficient_flash_liquidity(configured):
     result=await finalizer.finalize(cycle,1000,1200,quotes,101)
     assert result.submission_eligible is False
     assert "insufficient_aave_flash_liquidity" in result.blockers
+
+
+# Recorded `getReserveData(WETH)` return payload from the deployed Base mainnet Aave v3 Pool
+# (0xA238Dd80C259a72e81d7e4664a9801593F98d1c5). Kept as a fixed codec fixture: it exercises the
+# ABI shape only and never reaches a production path.
+BASE_AAVE_WETH_RESERVE_DATA = bytes.fromhex(
+    "100000000000000000000103e8000029428000022e9805dc85122904206c1f40"
+    "00000000000000000000000000000000000000000363e1ea061368f194268ab7"
+    "0000000000000000000000000000000000000000000fb14f2f9f310e86f5f49c"
+    "0000000000000000000000000000000000000000037b0e2bf60f0f7bcf7f0e1a"
+    "0000000000000000000000000000000000000000001498a09d3f854e6736140e"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000006a8a984d"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000d4a0e0b9149bcee3c920d2e00b5de09138fd8bb7"
+    "000000000000000000000000aed3b56fea82e809665f02acbcdec0816c75f4d9"
+    "00000000000000000000000024e6e0795b3c7c71d965fcc4f371803d1c1dca1e"
+    "00000000000000000000000086ab1c62a8bf868e1b3e1ab87d587aba6fbcbdc5"
+    "000000000000000000000000000000000000000000000000005d739cc694e3c1"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+BASE_AWETH = "0xd4a0e0b9149bcee3c920d2e00b5de09138fd8bb7"
+
+
+def test_aave_reserve_data_abi_matches_deployed_base_pool():
+    """The declared ABI must decode what Base's Pool actually returns.
+
+    A wider struct (for example the extended v3.2 shape) raises on decode, which turns every
+    route into `aave_snapshot_failed` and silently kills the whole execution path.
+    """
+    from eth_abi import decode
+    from eth_utils.abi import collapse_if_tuple
+
+    from arb_bot.execution import AAVE_POOL_ABI
+
+    entry = next(x for x in AAVE_POOL_ABI if x["name"] == "getReserveData")
+    output_type = collapse_if_tuple(entry["outputs"][0])
+    reserve = decode([output_type], BASE_AAVE_WETH_RESERVE_DATA)[0]
+
+    assert len(reserve) == 15
+    # Index 8 is aTokenAddress; reading index 9 would return the deprecated stable debt token
+    # and report ~zero available flash liquidity for every asset.
+    assert str(reserve[8]).lower() == BASE_AWETH
+    configuration = reserve[0][0] if isinstance(reserve[0], (tuple, list)) else reserve[0]
+    assert bool((int(configuration) >> 63) & 1) is True
