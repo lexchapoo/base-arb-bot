@@ -71,6 +71,13 @@ def main() -> int:
     parser.add_argument("--nonce", required=True, type=int, help="pending nonce of the deployment signer")
     parser.add_argument("--output", type=Path, help="write the reviewed plan to a new 0600 file")
     parser.add_argument(
+        "--implementation", default="",
+        help="address of an ALREADY-DEPLOYED BaseArbExecutorUpgradeable implementation. Use for "
+             "the second phase of a proxy deployment: the plan then starts at the ERC1967 proxy, "
+             "so every transaction in it can be estimated against real chain state. Requires "
+             "--upgradeable.",
+    )
+    parser.add_argument(
         "--upgradeable", action="store_true",
         help="deploy BaseArbExecutorUpgradeable behind an ERC1967 (UUPS) proxy instead of the "
              "immutable BaseArbExecutor. The owner key then also controls upgrades.",
@@ -98,7 +105,27 @@ def main() -> int:
     if not allowed_tokens:
         raise SystemExit("DEPLOY_ALLOWED_TOKENS must contain at least one verified token")
 
-    if args.upgradeable:
+    if args.implementation and not args.upgradeable:
+        raise SystemExit("--implementation requires --upgradeable")
+
+    if args.upgradeable and args.implementation:
+        # Phase 2: the implementation is already on-chain, so this plan begins at the proxy.
+        # Nothing here depends on a contract created later in the same plan, which means every
+        # transaction is estimable against real state before a single signature is requested.
+        implementation = address(args.implementation, "--implementation")
+        executor = create_address(deployer, args.nonce)
+        aero_adapter = create_address(deployer, args.nonce + 1)
+        uni_adapter = create_address(deployer, args.nonce + 2)
+        implementation_init = None
+        initialize_data = bytes.fromhex(
+            call_data("initialize(address)", ["address"], [aave_pool])[2:]
+        )
+        executor_init = init_code(
+            "ERC1967Proxy.sol", "ERC1967Proxy", ["address", "bytes"],
+            [implementation, initialize_data],
+        )
+        deploy_steps = [("deploy ERC1967Proxy + initialize (paused)", executor_init)]
+    elif args.upgradeable:
         # impl -> proxy -> adapters. The proxy is the executor: every later call and the
         # EXECUTOR_ADDRESS the bot uses must target the proxy, never the implementation.
         implementation = create_address(deployer, args.nonce)
@@ -165,6 +192,7 @@ def main() -> int:
         "intended_owner": owner,
         "starting_nonce": args.nonce,
         "upgradeable": bool(args.upgradeable),
+        "implementation_predeployed": bool(args.upgradeable and args.implementation),
         "predicted_addresses": {
             "executor": executor,
             **({"implementation": implementation} if implementation else {}),
@@ -173,7 +201,7 @@ def main() -> int:
         },
         "init_code_hashes": {
             "executor": "0x" + keccak(executor_init).hex(),
-            **({"implementation": "0x" + keccak(implementation_init).hex()} if implementation else {}),
+            **({"implementation": "0x" + keccak(implementation_init).hex()} if implementation_init else {}),
             "aerodrome_adapter": "0x" + keccak(aero_init).hex(),
             "uniswap_v3_adapter": "0x" + keccak(uni_init).hex(),
         },

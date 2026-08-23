@@ -105,12 +105,28 @@ def word_address(word: str) -> str:
 
 def verify_deployed_prefix(rpc_url: str, plan: dict[str, Any], resume_nonce: int) -> None:
     starting_nonce = int(plan["starting_nonce"])
-    if resume_nonce != starting_nonce + 3:
-        raise RuntimeError("resume is permitted only after the exact three-contract deployment prefix")
-    prefix = plan["transactions"][:3]
+    upgradeable = bool(plan.get("upgradeable"))
+    # A phase-2 plan begins at the proxy because the implementation is already on-chain, so its
+    # contract prefix is the same length as the immutable plan's.
+    predeployed_impl = bool(plan.get("implementation_predeployed"))
+    prefix_length = 4 if (upgradeable and not predeployed_impl) else 3
+    if resume_nonce != starting_nonce + prefix_length:
+        raise RuntimeError(
+            f"resume is permitted only after the exact {prefix_length}-contract deployment prefix"
+        )
+    prefix = plan["transactions"][:prefix_length]
     if [int(item["nonce"]) for item in prefix] != list(range(starting_nonce, resume_nonce)):
         raise RuntimeError("deployment plan does not contain the expected contiguous prefix")
     expected_purposes = [
+        "deploy ERC1967Proxy + initialize (paused)",
+        "deploy AerodromeAdapter",
+        "deploy UniswapV3Adapter",
+    ] if (upgradeable and predeployed_impl) else [
+        "deploy BaseArbExecutorUpgradeable implementation",
+        "deploy ERC1967Proxy + initialize (paused)",
+        "deploy AerodromeAdapter",
+        "deploy UniswapV3Adapter",
+    ] if upgradeable else [
         "deploy BaseArbExecutor (paused)",
         "deploy AerodromeAdapter",
         "deploy UniswapV3Adapter",
@@ -122,13 +138,33 @@ def verify_deployed_prefix(rpc_url: str, plan: dict[str, Any], resume_nonce: int
     executor = to_checksum_address(addresses["executor"])
     aerodrome = to_checksum_address(addresses["aerodrome_adapter"])
     uniswap = to_checksum_address(addresses["uniswap_v3_adapter"])
-    for label, address in (("executor", executor), ("aerodrome_adapter", aerodrome), ("uniswap_v3_adapter", uniswap)):
+    code_checks = [("executor", executor), ("aerodrome_adapter", aerodrome), ("uniswap_v3_adapter", uniswap)]
+    if upgradeable:
+        code_checks.append(("implementation", to_checksum_address(addresses["implementation"])))
+    for label, address in code_checks:
         if rpc(rpc_url, "eth_getCode", [address, "latest"]) in ("0x", "0x0"):
             raise RuntimeError(f"resume verification found no bytecode for {label}")
 
-    pool = word_address(constructor_words(prefix[0], 1)[0])
-    aero_executor, aero_router, aero_factory = map(word_address, constructor_words(prefix[1], 3))
-    uni_words = constructor_words(prefix[2], 3)
+    if upgradeable:
+        # `executor` is the proxy. Pin the slot it delegates to, or a resume could continue
+        # against a proxy that is already pointing somewhere else entirely.
+        actual_impl = call_address(rpc_url, executor, "implementation()")
+        if actual_impl.lower() != addresses["implementation"].lower():
+            raise RuntimeError(
+                f"resume verification: proxy delegates to {actual_impl}, expected {addresses['implementation']}"
+            )
+        # POOL is set by initialize(), not a constructor, so a zero here means the proxy was
+        # deployed but never initialized -- it would be claimable by whoever calls initialize.
+        pool = call_address(rpc_url, executor, "POOL()")
+        if int(pool, 16) == 0:
+            raise RuntimeError("resume verification: proxy POOL() is zero -- initialize did not run")
+        adapter_prefix = prefix[1:3] if predeployed_impl else prefix[2:4]
+    else:
+        pool = word_address(constructor_words(prefix[0], 1)[0])
+        adapter_prefix = prefix[1:3]
+
+    aero_executor, aero_router, aero_factory = map(word_address, constructor_words(adapter_prefix[0], 3))
+    uni_words = constructor_words(adapter_prefix[1], 3)
     uni_executor, uni_router = map(word_address, uni_words[:2])
     uni_router02 = int(uni_words[2], 16)
     if uni_router02 not in (0, 1):
@@ -137,7 +173,7 @@ def verify_deployed_prefix(rpc_url: str, plan: dict[str, Any], resume_nonce: int
     deployer = to_checksum_address(plan["deployer"])
     expected_addresses = {
         "executor owner": (call_address(rpc_url, executor, "owner()"), deployer),
-        "executor pool": (call_address(rpc_url, executor, "POOL()"), pool),
+        **({} if upgradeable else {"executor pool": (call_address(rpc_url, executor, "POOL()"), pool)}),
         "Aerodrome executor": (call_address(rpc_url, aerodrome, "executor()"), aero_executor),
         "Aerodrome router": (call_address(rpc_url, aerodrome, "router()"), aero_router),
         "Aerodrome factory": (call_address(rpc_url, aerodrome, "factory()"), aero_factory),
@@ -214,6 +250,7 @@ def main() -> int:
     base_fee = hex_int(pending_block["baseFeePerGas"])
     max_fee = base_fee * 2 + priority
     prepared: list[dict[str, Any]] = []
+    partial_after: int | None = None
     for transaction in plan["transactions"]:
         if int(transaction["nonce"]) < pending_nonce:
             continue
@@ -224,7 +261,21 @@ def main() -> int:
         }
         if transaction.get("to"):
             tx["to"] = transaction["to"]
-        estimated = hex_int(rpc(rpc_url, "eth_estimateGas", [tx, "pending"]))
+        try:
+            estimated = hex_int(rpc(rpc_url, "eth_estimateGas", [tx, "pending"]))
+        except RuntimeError as exc:
+            # A proxy deployment cannot be estimated before its implementation exists: the
+            # ERC1967 constructor reverts with ERC1967InvalidImplementation. The same is true of
+            # any later call whose target is created earlier in this same plan. Refusing to guess
+            # a gas limit, we prepare only the prefix that current chain state can actually
+            # estimate and require a follow-up --resume-from-nonce run once it has landed.
+            if int(transaction["nonce"]) == pending_nonce:
+                raise SystemExit(
+                    f"cannot estimate the next transaction (nonce {pending_nonce}, "
+                    f"{transaction['purpose']}): {exc}"
+                ) from exc
+            partial_after = int(transaction["nonce"])
+            break
         gas = (estimated * 120 + 99) // 100
         prepared.append({
             "plan_hash": plan_hash,
