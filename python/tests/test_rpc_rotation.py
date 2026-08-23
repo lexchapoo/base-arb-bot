@@ -89,3 +89,41 @@ async def test_balance_query_fails_over_to_the_next_endpoint(monkeypatch):
     balance = await provider.token_balance("0x" + "11" * 20, "0x" + "22" * 20)
     assert balance == 12345
     assert calls == ["a", "b"], f"expected failover a->b, got {calls}"
+
+
+@pytest.mark.asyncio
+async def test_failover_chain_is_bounded_by_the_per_attempt_timeout():
+    """The whole failover chain must fit inside the caller's deadline.
+
+    web3 leaves AsyncHTTPProvider without a request timeout, so a stalled endpoint blocks
+    indefinitely. Unbounded, N-endpoint failover blew route_evaluation_budget_seconds and the
+    budget guard discarded every route in the pass -- strictly worse than one endpoint failing
+    fast. Regression test for that interaction.
+    """
+    import asyncio
+    import time
+
+    providers = RotatingProviders(["https://a", "https://b", "https://c"], attempt_timeout_seconds=0.1)
+
+    async def _hangs(_client):
+        await asyncio.sleep(30)
+
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        await providers.attempt(_hangs)
+    elapsed = time.monotonic() - started
+    # 3 endpoints x 0.1s, with generous slack for scheduling
+    assert elapsed < 1.0, f"failover took {elapsed:.2f}s; must be bounded by attempt timeout"
+
+
+@pytest.mark.asyncio
+async def test_attempt_returns_first_success_without_trying_the_rest():
+    providers = RotatingProviders(["https://a", "https://b", "https://c"], attempt_timeout_seconds=1.0)
+    seen = []
+
+    async def _ok(client):
+        seen.append(id(client))
+        return "value"
+
+    assert await providers.attempt(_ok) == "value"
+    assert len(seen) == 1, "a successful first attempt must not query further endpoints"

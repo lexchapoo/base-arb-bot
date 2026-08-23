@@ -11,8 +11,10 @@ calldata; Solidity enforces min-profit and flash-loan repayment).
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
 
+import aiohttp
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 
@@ -40,12 +42,34 @@ class RotatingProviders:
     calls and retrying the next endpoint turns a hard route failure into a slower one.
     """
 
-    def __init__(self, urls: list[str]) -> None:
+    def __init__(self, urls: list[str], attempt_timeout_seconds: float = 1.5) -> None:
         if not urls:
             raise ValueError("at least one RPC endpoint is required")
         self.urls = urls
-        self._clients = [AsyncWeb3(AsyncHTTPProvider(url)) for url in urls]
+        # web3 leaves AsyncHTTPProvider without a request timeout, so a stalled endpoint blocks
+        # far past the caller's deadline. With failover that cost multiplies: N unbounded
+        # attempts in series. Bound each attempt so the whole chain still fits inside
+        # route_evaluation_budget_seconds, or the budget guard kills the pass and every route in
+        # it is discarded -- which is strictly worse than one endpoint failing fast.
+        self.attempt_timeout_seconds = max(0.25, float(attempt_timeout_seconds))
+        timeout = aiohttp.ClientTimeout(total=self.attempt_timeout_seconds)
+        self._clients = [
+            AsyncWeb3(AsyncHTTPProvider(url, request_kwargs={"timeout": timeout}))
+            for url in urls
+        ]
         self._counter = itertools.count()
+
+    async def attempt(self, coro_factory):
+        """Run `coro_factory(client)` against each endpoint in turn, bounded per attempt."""
+        last_error: Exception | None = None
+        for client in self.ordered():
+            try:
+                return await asyncio.wait_for(
+                    coro_factory(client), timeout=self.attempt_timeout_seconds
+                )
+            except Exception as exc:  # timeout, rate limit, 5xx
+                last_error = exc
+        raise last_error if last_error else RuntimeError("no RPC endpoint available")
 
     def __len__(self) -> int:
         return len(self._clients)
@@ -89,17 +113,18 @@ AGGREGATE3_ABI = [
 
 
 class MulticallClient:
-    def __init__(self, rpc_url: str | list[str], address: str = MULTICALL3_ADDRESS) -> None:
+    def __init__(
+        self,
+        rpc_url: str | list[str],
+        address: str = MULTICALL3_ADDRESS,
+        attempt_timeout_seconds: float = 1.5,
+    ) -> None:
         urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
-        self.providers = RotatingProviders(urls)
+        self.providers = RotatingProviders(urls, attempt_timeout_seconds)
         self.address = AsyncWeb3.to_checksum_address(address)
-        self._contracts = [
-            w3.eth.contract(address=self.address, abi=AGGREGATE3_ABI)
-            for w3 in self.providers._clients
-        ]
         # Preserved for callers/tests that reach for a single client.
         self.w3 = self.providers._clients[0]
-        self.contract = self._contracts[0]
+        self.contract = self.w3.eth.contract(address=self.address, abi=AGGREGATE3_ABI)
 
     async def aggregate3(
         self,
@@ -118,18 +143,11 @@ class MulticallClient:
             (AsyncWeb3.to_checksum_address(target), True, call_data)
             for target, call_data in calls
         ]
-        last_error: Exception | None = None
-        for contract in self._ordered_contracts():
-            try:
-                results = await contract.functions.aggregate3(payload).call(
-                    block_identifier=block_identifier
-                )
-            except Exception as exc:  # provider-level failure (rate limit, timeout, 5xx)
-                last_error = exc
-                continue
-            return [(bool(success), bytes(return_data)) for success, return_data in results]
-        raise last_error if last_error else RuntimeError("multicall produced no result")
+        async def _call(client):
+            contract = client.eth.contract(address=self.address, abi=AGGREGATE3_ABI)
+            return await contract.functions.aggregate3(payload).call(
+                block_identifier=block_identifier
+            )
 
-    def _ordered_contracts(self):
-        start = next(self.providers._counter) % len(self._contracts)
-        return self._contracts[start:] + self._contracts[:start]
+        results = await self.providers.attempt(_call)
+        return [(bool(success), bytes(return_data)) for success, return_data in results]

@@ -84,12 +84,12 @@ class AdapterRegistry:
 
 
 class LiveBalanceProvider:
-    def __init__(self, rpc_url: str | list[str]) -> None:
+    def __init__(self, rpc_url: str | list[str], attempt_timeout_seconds: float = 1.5) -> None:
         from web3 import AsyncWeb3
         from .multicall import RotatingProviders
         self._async_web3 = AsyncWeb3
         urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
-        self.providers = RotatingProviders(urls)
+        self.providers = RotatingProviders(urls, attempt_timeout_seconds)
         # Preserved for callers/tests that reach for a single client.
         self.w3 = self.providers._clients[0]
 
@@ -98,20 +98,17 @@ class LiveBalanceProvider:
         # so it runs precisely when the provider is already under pressure. Failing over to the
         # next endpoint keeps a rate limit from turning into `live_balance_query_failed`, which
         # discards the route entirely.
-        last_error: Exception | None = None
-        for w3 in self.providers.ordered():
-            try:
-                contract = w3.eth.contract(
-                    address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
-                )
-                return int(
-                    await contract.functions.balanceOf(
-                        self._async_web3.to_checksum_address(account)
-                    ).call(block_identifier=block_identifier)
-                )
-            except Exception as exc:
-                last_error = exc
-        raise last_error if last_error else RuntimeError("no RPC endpoint available")
+        async def _call(w3):
+            contract = w3.eth.contract(
+                address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
+            )
+            return int(
+                await contract.functions.balanceOf(
+                    self._async_web3.to_checksum_address(account)
+                ).call(block_identifier=block_identifier)
+            )
+
+        return await self.providers.attempt(_call)
 
 
 class RouteOptimizer:
@@ -259,8 +256,9 @@ class RouteOptimizer:
         if self._multicall_client is None:
             from .multicall import MulticallClient
             from .multicall import endpoint_list
+            _urls = endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
             self._multicall_client = MulticallClient(
-                endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+                _urls, attempt_timeout_seconds=settings.quote_timeout_seconds / max(1, 2 * len(_urls))
             )
         return self._multicall_client
 
@@ -354,8 +352,10 @@ class RouteOptimizer:
             try:
                 if self.balance_provider is None:
                     from .multicall import endpoint_list
+                    _urls = endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
                     self.balance_provider = LiveBalanceProvider(
-                        endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+                        _urls,
+                        attempt_timeout_seconds=settings.quote_timeout_seconds / max(1, 2 * len(_urls)),
                     )
                 upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
             except Exception as exc:
