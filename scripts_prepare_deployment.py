@@ -19,7 +19,9 @@ from eth_utils import keccak, to_checksum_address
 
 
 ROOT = Path(__file__).resolve().parent
-ARTIFACTS = ROOT / "contracts" / "out"
+# Overridable so the plan can be generated from a writable artifact directory when the default
+# out/ is not usable (e.g. left root-owned by a prior container/tooling run).
+ARTIFACTS = Path(os.environ.get("DEPLOY_ARTIFACTS_DIR") or (ROOT / "contracts" / "out"))
 
 
 def address(value: str, label: str) -> str:
@@ -68,6 +70,11 @@ def main() -> int:
     parser.add_argument("--owner", default=os.environ.get("EXECUTOR_OWNER_ADDRESS", ""))
     parser.add_argument("--nonce", required=True, type=int, help="pending nonce of the deployment signer")
     parser.add_argument("--output", type=Path, help="write the reviewed plan to a new 0600 file")
+    parser.add_argument(
+        "--upgradeable", action="store_true",
+        help="deploy BaseArbExecutorUpgradeable behind an ERC1967 (UUPS) proxy instead of the "
+             "immutable BaseArbExecutor. The owner key then also controls upgrades.",
+    )
     args = parser.parse_args()
 
     if os.environ.get("DRY_RUN", "true").lower() not in {"1", "true", "yes", "on"}:
@@ -91,11 +98,36 @@ def main() -> int:
     if not allowed_tokens:
         raise SystemExit("DEPLOY_ALLOWED_TOKENS must contain at least one verified token")
 
-    executor = create_address(deployer, args.nonce)
-    aero_adapter = create_address(deployer, args.nonce + 1)
-    uni_adapter = create_address(deployer, args.nonce + 2)
-
-    executor_init = init_code("BaseArbExecutor.sol", "BaseArbExecutor", ["address"], [aave_pool])
+    if args.upgradeable:
+        # impl -> proxy -> adapters. The proxy is the executor: every later call and the
+        # EXECUTOR_ADDRESS the bot uses must target the proxy, never the implementation.
+        implementation = create_address(deployer, args.nonce)
+        executor = create_address(deployer, args.nonce + 1)
+        aero_adapter = create_address(deployer, args.nonce + 2)
+        uni_adapter = create_address(deployer, args.nonce + 3)
+        implementation_init = init_code(
+            "BaseArbExecutorUpgradeable.sol", "BaseArbExecutorUpgradeable", [], []
+        )
+        # initialize(pool) runs in the proxy's context via the ERC1967 constructor, so the proxy
+        # can never be left uninitialized and claimable in a separate transaction.
+        initialize_data = bytes.fromhex(
+            call_data("initialize(address)", ["address"], [aave_pool])[2:]
+        )
+        executor_init = init_code(
+            "ERC1967Proxy.sol", "ERC1967Proxy", ["address", "bytes"],
+            [implementation, initialize_data],
+        )
+        deploy_steps = [
+            ("deploy BaseArbExecutorUpgradeable implementation", implementation_init),
+            ("deploy ERC1967Proxy + initialize (paused)", executor_init),
+        ]
+    else:
+        implementation = None
+        executor = create_address(deployer, args.nonce)
+        aero_adapter = create_address(deployer, args.nonce + 1)
+        uni_adapter = create_address(deployer, args.nonce + 2)
+        executor_init = init_code("BaseArbExecutor.sol", "BaseArbExecutor", ["address"], [aave_pool])
+        deploy_steps = [("deploy BaseArbExecutor (paused)", executor_init)]
     aero_init = init_code(
         "AerodromeAdapter.sol", "AerodromeAdapter", ["address", "address", "address"],
         [executor, aero_router, aero_factory],
@@ -106,14 +138,15 @@ def main() -> int:
     )
 
     nonce = args.nonce
-    transactions = [
-        transaction(nonce, "deploy BaseArbExecutor (paused)", None, executor_init),
-        transaction(nonce + 1, "deploy AerodromeAdapter", None, aero_init),
-        transaction(nonce + 2, "deploy UniswapV3Adapter", None, uni_init),
-        transaction(nonce + 3, "allow AerodromeAdapter", executor, call_data("setAdapter(address,bool)", ["address", "bool"], [aero_adapter, True])),
-        transaction(nonce + 4, "allow UniswapV3Adapter", executor, call_data("setAdapter(address,bool)", ["address", "bool"], [uni_adapter, True])),
-    ]
-    nonce += 5
+    transactions = []
+    for purpose, init in deploy_steps:
+        transactions.append(transaction(nonce, purpose, None, init))
+        nonce += 1
+    transactions.append(transaction(nonce, "deploy AerodromeAdapter", None, aero_init))
+    transactions.append(transaction(nonce + 1, "deploy UniswapV3Adapter", None, uni_init))
+    transactions.append(transaction(nonce + 2, "allow AerodromeAdapter", executor, call_data("setAdapter(address,bool)", ["address", "bool"], [aero_adapter, True])))
+    transactions.append(transaction(nonce + 3, "allow UniswapV3Adapter", executor, call_data("setAdapter(address,bool)", ["address", "bool"], [uni_adapter, True])))
+    nonce += 4
     for token in allowed_tokens:
         transactions.append(
             transaction(nonce, f"allow token {token}", executor, call_data("setToken(address,bool)", ["address", "bool"], [token, True]))
@@ -131,13 +164,16 @@ def main() -> int:
         "deployer": deployer,
         "intended_owner": owner,
         "starting_nonce": args.nonce,
+        "upgradeable": bool(args.upgradeable),
         "predicted_addresses": {
             "executor": executor,
+            **({"implementation": implementation} if implementation else {}),
             "aerodrome_adapter": aero_adapter,
             "uniswap_v3_adapter": uni_adapter,
         },
         "init_code_hashes": {
             "executor": "0x" + keccak(executor_init).hex(),
+            **({"implementation": "0x" + keccak(implementation_init).hex()} if implementation else {}),
             "aerodrome_adapter": "0x" + keccak(aero_init).hex(),
             "uniswap_v3_adapter": "0x" + keccak(uni_init).hex(),
         },
@@ -145,6 +181,9 @@ def main() -> int:
         "postconditions": [
             "verify code and constructor immutables at every predicted address",
             "verify executor.paused() is true",
+            "if upgradeable: EXECUTOR_ADDRESS must be the PROXY, never the implementation",
+            "if upgradeable: verify the implementation cannot be initialized (owner() == 0)",
+            "if upgradeable: the owner key also controls upgradeToAndCall -- treat it as a total-loss key",
             "verify adapter and token allowlists",
             "if owner differs from deployer, intended owner must separately call acceptOwnership()",
             "do not call setPaused(false) before the shadow and canary gates pass",

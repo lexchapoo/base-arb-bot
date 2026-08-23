@@ -1,0 +1,17 @@
+# Echidna configuration for BaseArbExecutorUpgradeableEchidna.
+#
+# Run (Foundry's out/ must be writable by the invoking user):
+#   echidna contracts/test/echidna/BaseArbExecutorUpgradeableEchidna.sol \
+#     --contract BaseArbExecutorUpgradeableEchidna \
+#     --config contracts/echidna.upgradeable.config.yaml
+#
+# If running via the crytic docker image, pass --user "$(id -u):$(id -g)" and mount writable
+# out/ and cache/ directories; running it as root is what leaves root-owned build artifacts
+# behind and breaks subsequent `make solidity-test` runs.
+testMode: property
+testLimit: 50000
+# Required: the fuzzer must be able to call UpgradeAttacker directly, not just the harness.
+allContracts: true
+# Unprivileged senders only -- none of these is the executor owner (the harness contract).
+sender: ["0x10000", "0x20000", "0x30000"]
+corpusDir: echidna-corpus

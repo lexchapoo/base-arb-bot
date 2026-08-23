@@ -17,3 +17,6 @@ echidna-corpus/
 crytic-export/
 contracts/echidna-corpus/
 contracts/crytic-export/
+
+# Foundry dependencies (restored by scripts/setup_linux.sh via `forge install`)
+contracts/lib/
