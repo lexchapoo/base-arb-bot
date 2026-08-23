@@ -84,21 +84,34 @@ class AdapterRegistry:
 
 
 class LiveBalanceProvider:
-    def __init__(self, rpc_url: str) -> None:
+    def __init__(self, rpc_url: str | list[str]) -> None:
         from web3 import AsyncWeb3
-        from web3.providers import AsyncHTTPProvider
+        from .multicall import RotatingProviders
         self._async_web3 = AsyncWeb3
-        self.w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
+        self.providers = RotatingProviders(urls)
+        # Preserved for callers/tests that reach for a single client.
+        self.w3 = self.providers._clients[0]
 
     async def token_balance(self, token: str, account: str, block_identifier: str = "pending") -> int:
-        contract = self.w3.eth.contract(
-            address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
-        )
-        return int(
-            await contract.functions.balanceOf(
-                self._async_web3.to_checksum_address(account)
-            ).call(block_identifier=block_identifier)
-        )
+        # This is the fallback path taken when the multicall prefetch did not supply the balance,
+        # so it runs precisely when the provider is already under pressure. Failing over to the
+        # next endpoint keeps a rate limit from turning into `live_balance_query_failed`, which
+        # discards the route entirely.
+        last_error: Exception | None = None
+        for w3 in self.providers.ordered():
+            try:
+                contract = w3.eth.contract(
+                    address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
+                )
+                return int(
+                    await contract.functions.balanceOf(
+                        self._async_web3.to_checksum_address(account)
+                    ).call(block_identifier=block_identifier)
+                )
+            except Exception as exc:
+                last_error = exc
+        raise last_error if last_error else RuntimeError("no RPC endpoint available")
 
 
 class RouteOptimizer:
@@ -245,7 +258,10 @@ class RouteOptimizer:
     def _multicall(self) -> "MulticallClient":
         if self._multicall_client is None:
             from .multicall import MulticallClient
-            self._multicall_client = MulticallClient(settings.base_http_rpc)
+            from .multicall import endpoint_list
+            self._multicall_client = MulticallClient(
+                endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+            )
         return self._multicall_client
 
     async def _batched_quotes(
@@ -337,7 +353,10 @@ class RouteOptimizer:
             # Not prefetched (or batching unavailable): fall back to a live query.
             try:
                 if self.balance_provider is None:
-                    self.balance_provider = LiveBalanceProvider(settings.base_http_rpc)
+                    from .multicall import endpoint_list
+                    self.balance_provider = LiveBalanceProvider(
+                        endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+                    )
                 upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
             except Exception as exc:
                 return None, None, [], [f"live_balance_query_failed:{type(exc).__name__}"]
