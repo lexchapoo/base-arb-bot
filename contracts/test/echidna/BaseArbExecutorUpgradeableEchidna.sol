@@ -34,7 +34,7 @@ contract BaseArbExecutorUpgradeableEchidna {
         originalImplementation = address(impl);
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool)))
+            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool), address(0)))
         );
         executor = BaseArbExecutorUpgradeable(address(proxy)); // owner == this contract
         candidateImplementation = address(new BaseArbExecutorUpgradeable());
@@ -108,7 +108,7 @@ contract UpgradeAttacker {
     function attackUpgradeWithInit(address pool) public {
         attempts++;
         BaseArbExecutorUpgradeable(target).upgradeToAndCall(
-            candidate, abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (pool))
+            candidate, abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (pool, address(0)))
         );
     }
 }

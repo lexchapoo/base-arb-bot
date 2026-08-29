@@ -35,6 +35,11 @@ _STATEMENTS = [
        )""",
     "CREATE INDEX IF NOT EXISTS ix_curated_pools_token0 ON curated_pools(token0)",
     "CREATE INDEX IF NOT EXISTS ix_curated_pools_token1 ON curated_pools(token1)",
+    # Which flash-loan venue each route was priced against. Nullable with no default: rows
+    # written before this column existed genuinely do not know, and backfilling them with
+    # 'aave' would invent a fact -- a shadow comparison must not treat a guess as a sample.
+    "ALTER TABLE route_evaluations ADD COLUMN IF NOT EXISTS flash_provider VARCHAR(16)",
+    "CREATE INDEX IF NOT EXISTS ix_route_evaluations_flash_provider ON route_evaluations(flash_provider)",
 ]
 
 async def migrate_v012() -> None:

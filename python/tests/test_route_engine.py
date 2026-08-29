@@ -68,6 +68,7 @@ class FakeBalance:
 class FakeFinalizer:
     async def finalize(self, cycle, amount_in, amount_out, quotes, observed_block):
         return ExecutionFinalization(
+            flash_provider="aave",
             calldata="0x1234",
             route_hash="0x"+"22"*32,
             target_block=observed_block,

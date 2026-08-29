@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "./interfaces.sol";
 
-contract BaseArbExecutor is IFlashLoanSimpleReceiver {
+contract BaseArbExecutor is IFlashLoanSimpleReceiver, IMorphoFlashLoanCallback {
     error Unauthorized();
     error InvalidRoute();
     error StaleRoute();
@@ -17,6 +17,18 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
     error InvalidPackedBatch();
     error NoCandidateSucceeded();
     error CommitmentAlreadyUsed();
+    error InvalidProvider();
+    error ProviderNotConfigured();
+
+    /// Which venue a route borrows from. Chosen per call rather than baked into the route
+    /// commitment: the provider changes only where the principal comes from and what is owed,
+    /// never what the route does, and `start`/`startPacked` are onlyOwner -- so it is not
+    /// attacker-controlled input and does not belong in the hash preimage. Per-call selection
+    /// is what lets a shadow run A/B the two on otherwise identical routes.
+    ///
+    /// `None` is the idle value, so a callback can require its own provider and reject any
+    /// invocation that arrives while no borrow of that kind is in flight.
+    enum FlashProvider { None, Aave, Morpho }
 
     uint8 public constant PACKED_VERSION = 1;
     uint8 public constant MAX_PACKED_CANDIDATES = 8;
@@ -56,6 +68,9 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
     }
 
     IAavePool public immutable POOL;
+    /// Optional second provider. Zero means Morpho routes are refused rather than silently
+    /// falling back to Aave, which would bill a 5bp premium the caller did not ask for.
+    IMorpho public immutable MORPHO;
     address public owner;
     address public pendingOwner;
     mapping(address => bool) public adapterAllowed;
@@ -71,6 +86,10 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
     uint8 private activeSelectedCandidateIndex;
     uint256 private activeSelectedMinProfit;
     bool private callbackEntered;
+    FlashProvider private activeProvider;
+    /// Morpho's callback does not pass the borrowed token, so the value start()/startPacked()
+    /// committed to has to be carried across the call.
+    address private activeAsset;
 
     event RouteExecuted(bytes32 indexed routeHash, address indexed asset, uint256 amount, uint256 premium, uint256 netProfit);
     event PackedRouteExecuted(
@@ -109,9 +128,12 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         _;
     }
 
-    constructor(address pool) {
+    constructor(address pool, address morpho) {
         if (pool == address(0)) revert Unauthorized();
         POOL = IAavePool(pool);
+        // Zero is allowed: Morpho is opt-in, and a deployment that does not want it should not
+        // be forced to name an address it will never call.
+        MORPHO = IMorpho(morpho);
         owner = msg.sender;
         // Deploy dark: the operator must explicitly arm the executor with setPaused(false)
         // after adapters/tokens are allowlisted and verified.
@@ -149,7 +171,7 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         emit OwnershipTransferred(previous, msg.sender);
     }
 
-    function start(Route calldata route) external onlyOwner {
+    function start(Route calldata route, FlashProvider provider) external onlyOwner {
         if (paused) revert Paused();
         if (activeRouteHash != bytes32(0) || activeBatchHash != bytes32(0)) revert Reentrant();
         if (block.number > route.targetBlock || block.timestamp > route.deadline) revert StaleRoute();
@@ -160,14 +182,18 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         commitmentUsed[route.routeHash] = true;
 
         activeRouteHash = route.routeHash;
+        activeProvider = provider;
+        activeAsset = route.asset;
         activePreLoanBalance = IERC20(route.asset).balanceOf(address(this));
 
-        POOL.flashLoanSimple(address(this), route.asset, route.amount, abi.encode(route), 0);
+        _borrow(provider, route.asset, route.amount, abi.encode(route));
 
         uint256 finalBalance = IERC20(route.asset).balanceOf(address(this));
         uint256 preBalance = activePreLoanBalance;
         uint256 chargedPremium = activePremium;
         activeRouteHash = bytes32(0);
+        activeProvider = FlashProvider.None;
+        activeAsset = address(0);
         activePreLoanBalance = 0;
         activePremium = 0;
 
@@ -180,7 +206,7 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
     /// version:u8 | candidateCount:u8 | asset:20 | amount:u256 | targetBlock:u64 | deadline:u64 |
     /// repeated candidate: candidateId:bytes32 | minProfit:u256 | legCount:u8 |
     /// repeated leg: adapter:20 | tokenIn:20 | tokenOut:20 | minOut:u256 | dataLen:u16 | data:dataLen.
-    function startPacked(bytes calldata packed) external onlyOwner {
+    function startPacked(bytes calldata packed, FlashProvider provider) external onlyOwner {
         if (paused) revert Paused();
         if (activeRouteHash != bytes32(0) || activeBatchHash != bytes32(0)) revert Reentrant();
 
@@ -193,12 +219,14 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         if (commitmentUsed[batchHash]) revert CommitmentAlreadyUsed();
         commitmentUsed[batchHash] = true;
         activeBatchHash = batchHash;
+        activeProvider = provider;
+        activeAsset = header.asset;
         activePreLoanBalance = IERC20(header.asset).balanceOf(address(this));
         activeSelectedCandidateId = bytes32(0);
         activeSelectedCandidateIndex = 0;
         activeSelectedMinProfit = 0;
 
-        POOL.flashLoanSimple(address(this), header.asset, header.amount, packed, 0);
+        _borrowPacked(provider, header.asset, header.amount, packed);
 
         uint256 finalBalance = IERC20(header.asset).balanceOf(address(this));
         uint256 preBalance = activePreLoanBalance;
@@ -208,6 +236,8 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         uint256 selectedMinProfit = activeSelectedMinProfit;
 
         activeBatchHash = bytes32(0);
+        activeProvider = FlashProvider.None;
+        activeAsset = address(0);
         activePreLoanBalance = 0;
         activePremium = 0;
         activeSelectedCandidateId = bytes32(0);
@@ -227,13 +257,36 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         bytes calldata params
     ) external returns (bool) {
         if (msg.sender != address(POOL) || initiator != address(this)) revert Unauthorized();
+        // Refuse an Aave callback while a Morpho borrow is the one in flight: the two differ in
+        // what is owed, and honouring the wrong one would approve the wrong amount.
+        if (activeProvider != FlashProvider.Aave) revert Unauthorized();
+        _onFlashLoan(asset, amount, premium, params);
+        return true;
+    }
+
+    /// Morpho's flash loan callback.
+    ///
+    /// There is deliberately no `initiator` check, and its absence is not a weakening: Morpho
+    /// invokes this on the *caller* of flashLoan(), so the only way to reach here is for this
+    /// contract to have borrowed. No other account can aim Morpho's callback at us. The
+    /// activeProvider check then ensures we are inside our own Morpho borrow specifically.
+    ///
+    /// `assets` is the full amount owed -- Morpho charges no premium, so the premium passed
+    /// down is a literal zero rather than a value read from the provider.
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
+        if (msg.sender != address(MORPHO)) revert Unauthorized();
+        if (activeProvider != FlashProvider.Morpho) revert Unauthorized();
+        _onFlashLoan(activeAsset, assets, 0, data);
+    }
+
+    function _onFlashLoan(address asset, uint256 amount, uint256 premium, bytes calldata params) internal {
         if (callbackEntered) revert Reentrant();
         callbackEntered = true;
 
         if (activeBatchHash != bytes32(0)) {
             _executePackedCallback(asset, amount, premium, params);
             callbackEntered = false;
-            return true;
+            return;
         }
 
         Route memory route = abi.decode(params, (Route));
@@ -251,9 +304,36 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         if (afterBalance < owed) revert InsufficientRepayment();
         if (afterBalance < required) revert ProfitTooLow();
 
-        _forceApprove(asset, address(POOL), owed);
+        _forceApprove(asset, _providerAddress(), owed);
         callbackEntered = false;
-        return true;
+    }
+
+    function _providerAddress() internal view returns (address) {
+        return activeProvider == FlashProvider.Morpho ? address(MORPHO) : address(POOL);
+    }
+
+    function _borrow(FlashProvider provider, address asset, uint256 amount, bytes memory params) internal {
+        if (provider == FlashProvider.Morpho) {
+            if (address(MORPHO) == address(0)) revert ProviderNotConfigured();
+            MORPHO.flashLoan(asset, amount, params);
+        } else if (provider == FlashProvider.Aave) {
+            POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+        } else {
+            revert InvalidProvider();
+        }
+    }
+
+    /// Calldata twin of _borrow. startPacked's payload runs to several KB and copying it into
+    /// memory purely to dispatch would be paid on every batched route.
+    function _borrowPacked(FlashProvider provider, address asset, uint256 amount, bytes calldata params) internal {
+        if (provider == FlashProvider.Morpho) {
+            if (address(MORPHO) == address(0)) revert ProviderNotConfigured();
+            MORPHO.flashLoan(asset, amount, params);
+        } else if (provider == FlashProvider.Aave) {
+            POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+        } else {
+            revert InvalidProvider();
+        }
     }
 
     function attemptPackedCandidate(PackedCandidate calldata candidate, address asset, uint256 amount, uint256 premium)
@@ -309,7 +389,7 @@ contract BaseArbExecutor is IFlashLoanSimpleReceiver {
         activePremium = premium;
         uint256 owed = amount + premium;
         if (IERC20(asset).balanceOf(address(this)) < activePreLoanBalance + owed + activeSelectedMinProfit) revert ProfitTooLow();
-        _forceApprove(asset, address(POOL), owed);
+        _forceApprove(asset, _providerAddress(), owed);
     }
 
     function _executeLegs(Leg[] memory legs, uint256 firstAmount) internal {

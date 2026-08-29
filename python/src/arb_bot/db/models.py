@@ -75,6 +75,9 @@ class RouteEvaluationRecord(Base):
     estimate_gas_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     total_native_fee_wei: Mapped[str | None] = mapped_column(String(96), nullable=True)
     gas_cost_asset_units: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    # Which venue the route was priced against. A dedicated column, not just a key inside
+    # execution_json, so a shadow report can GROUP BY it without parsing every row.
+    flash_provider: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     flashloan_premium_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     flashloan_premium_units: Mapped[str | None] = mapped_column(String(96), nullable=True)
     deterministic_net_profit_units: Mapped[str | None] = mapped_column(String(96), nullable=True)

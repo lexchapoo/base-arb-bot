@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parent
 ARTIFACTS = Path(os.environ.get("DEPLOY_ARTIFACTS_DIR") or (ROOT / "contracts" / "out"))
 
 
+ZERO_ADDRESS = "0x" + "0" * 40
+
+
 def address(value: str, label: str) -> str:
     try:
         result = to_checksum_address(value)
@@ -115,6 +118,12 @@ def main() -> int:
     deployer = address(args.deployer, "deployer")
     owner = address(args.owner or deployer, "owner")
     aave_pool = address(os.environ.get("AAVE_POOL", ""), "AAVE_POOL")
+    # Optional second flash-loan provider. Unlike every other address here, zero is a valid
+    # value: it means "this deployment does not use Morpho", and the executor then refuses
+    # Morpho routes rather than falling back to Aave. address() rejects zero, so it cannot be
+    # used for a knowingly-empty field.
+    morpho_raw = os.environ.get("MORPHO_ADDRESS", "").strip()
+    morpho = address(morpho_raw, "MORPHO_ADDRESS") if morpho_raw else ZERO_ADDRESS
     aero_router = address(os.environ.get("AERODROME_ROUTER", ""), "AERODROME_ROUTER")
     aero_factory = address(os.environ.get("AERODROME_FACTORY", ""), "AERODROME_FACTORY")
     uni_router = address(os.environ.get("UNISWAP_V3_SWAP_ROUTER_02", ""), "UNISWAP_V3_SWAP_ROUTER_02")
@@ -187,7 +196,7 @@ def main() -> int:
         uni_adapter = create_address(deployer, args.nonce + 2)
         implementation_init = None
         initialize_data = bytes.fromhex(
-            call_data("initialize(address)", ["address"], [aave_pool])[2:]
+            call_data("initialize(address,address)", ["address", "address"], [aave_pool, morpho])[2:]
         )
         executor_init = init_code(
             "ERC1967Proxy.sol", "ERC1967Proxy", ["address", "bytes"],
@@ -207,7 +216,7 @@ def main() -> int:
         # initialize(pool) runs in the proxy's context via the ERC1967 constructor, so the proxy
         # can never be left uninitialized and claimable in a separate transaction.
         initialize_data = bytes.fromhex(
-            call_data("initialize(address)", ["address"], [aave_pool])[2:]
+            call_data("initialize(address,address)", ["address", "address"], [aave_pool, morpho])[2:]
         )
         executor_init = init_code(
             "ERC1967Proxy.sol", "ERC1967Proxy", ["address", "bytes"],
@@ -223,7 +232,9 @@ def main() -> int:
         executor = create_address(deployer, args.nonce)
         aero_adapter = create_address(deployer, args.nonce + 1)
         uni_adapter = create_address(deployer, args.nonce + 2)
-        executor_init = init_code("BaseArbExecutor.sol", "BaseArbExecutor", ["address"], [aave_pool])
+        executor_init = init_code(
+            "BaseArbExecutor.sol", "BaseArbExecutor", ["address", "address"], [aave_pool, morpho]
+        )
         deploy_steps = [("deploy BaseArbExecutor (paused)", executor_init)]
     aero_init = init_code(
         "AerodromeAdapter.sol", "AerodromeAdapter", ["address", "address", "address"],

@@ -93,6 +93,19 @@ class Settings(BaseSettings):
     # node reports recently created pools as non-existent, which silently drops them.
     # Inert unless pool_discovery_call_rpc_url is set: with one endpoint there is no lag.
     pool_discovery_max_call_lag_blocks: int = 64
+    # Which venue routes borrow their principal from. "aave" keeps the historical behaviour
+    # (Aave v3, 5bp premium); "morpho" borrows from Morpho Blue, which charges no premium at
+    # all and, on Base, holds roughly an order of magnitude more WETH. Selected per submission
+    # rather than baked into the executor, so a shadow run can A/B the two.
+    flash_provider: str = "aave"
+    # Shadow only: price every route against the *other* provider as well and record the
+    # comparison alongside the real evaluation. Doubles the RPC cost of an evaluation, so it
+    # is refused outside DRY_RUN -- it buys a number nothing acts on, which is exactly what a
+    # shadow run is for and exactly what live trading should not pay for.
+    shadow_compare_providers: bool = False
+    # Morpho Blue singleton. Required only when flash_provider is "morpho"; the executor
+    # refuses Morpho routes rather than falling back to Aave when this is unset.
+    morpho_address: str = ""
     executor_address: str = ""
     executor_owner_address: str = ""
     aave_pool: str = ""

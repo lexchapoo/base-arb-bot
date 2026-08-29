@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS route_evaluations (
   estimate_gas_units BIGINT,
   total_native_fee_wei VARCHAR(96),
   gas_cost_asset_units VARCHAR(96),
+  flash_provider VARCHAR(16),
   flashloan_premium_bps INTEGER,
   flashloan_premium_units VARCHAR(96),
   deterministic_net_profit_units VARCHAR(96),
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS route_evaluations (
 );
 CREATE INDEX IF NOT EXISTS ix_route_evaluations_route_id ON route_evaluations(route_id);
 CREATE INDEX IF NOT EXISTS ix_route_evaluations_trigger_pool ON route_evaluations(trigger_pool);
+CREATE INDEX IF NOT EXISTS ix_route_evaluations_flash_provider ON route_evaluations(flash_provider);
 
 CREATE TABLE IF NOT EXISTS verified_pools (
   address VARCHAR(42) PRIMARY KEY,

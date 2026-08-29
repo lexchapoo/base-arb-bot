@@ -768,6 +768,7 @@ async def route_trigger(trigger: PendingLogTrigger):
                     estimate_gas_units=result.execution.get("estimate_gas_units") if result.execution else None,
                     total_native_fee_wei=str(result.execution.get("total_native_fee_wei")) if result.execution and result.execution.get("total_native_fee_wei") is not None else None,
                     gas_cost_asset_units=str(result.execution.get("gas_cost_asset_units")) if result.execution and result.execution.get("gas_cost_asset_units") is not None else None,
+                    flash_provider=result.execution.get("flash_provider") if result.execution else None,
                     flashloan_premium_bps=result.execution.get("flashloan_premium_bps") if result.execution else None,
                     flashloan_premium_units=str(result.execution.get("flashloan_premium_units")) if result.execution and result.execution.get("flashloan_premium_units") is not None else None,
                     deterministic_net_profit_units=str(result.execution.get("deterministic_net_profit_units")) if result.execution and result.execution.get("deterministic_net_profit_units") is not None else None,

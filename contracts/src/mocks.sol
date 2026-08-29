@@ -38,6 +38,16 @@ contract MockPool is IAavePool {
     }
 }
 
+/// Mirrors Morpho Blue's flashLoan: no premium, callback on the caller (never on a supplied
+/// receiver address), repayment pulled with transferFrom after the borrower approves.
+contract MockMorpho is IMorpho {
+    function flashLoan(address token, uint256 assets, bytes calldata data) external {
+        MockERC20(token).mint(msg.sender, assets);
+        IMorphoFlashLoanCallback(msg.sender).onMorphoFlashLoan(assets, data);
+        require(MockERC20(token).transferFrom(msg.sender, address(this), assets), "repay");
+    }
+}
+
 contract MockExchangeAdapter is IExchangeAdapter {
     uint256 public numerator;
     uint256 public denominator;

@@ -17,7 +17,7 @@ contract BaseArbExecutorUpgradeableTest {
         pool = new MockPool(10);
         BaseArbExecutorUpgradeable impl = new BaseArbExecutorUpgradeable();
         ERC1967Proxy proxy = new ERC1967Proxy(
-            address(impl), abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool)))
+            address(impl), abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool), address(0)))
         );
         exec = BaseArbExecutorUpgradeable(address(proxy));
     }
@@ -37,7 +37,7 @@ contract BaseArbExecutorUpgradeableTest {
     function testInitializeCannotBeCalledTwice() public {
         (BaseArbExecutorUpgradeable exec, MockPool pool) = _deploy();
         (bool ok,) = address(exec).call(
-            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool)))
+            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool), address(0)))
         );
         require(!ok, "re-initialization must revert");
     }
@@ -49,7 +49,7 @@ contract BaseArbExecutorUpgradeableTest {
         MockPool pool = new MockPool(10);
         BaseArbExecutorUpgradeable impl = new BaseArbExecutorUpgradeable();
         (bool ok,) = address(impl).call(
-            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool)))
+            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool), address(0)))
         );
         require(!ok, "implementation must not be initializable");
         require(impl.owner() == address(0), "implementation must be unowned");

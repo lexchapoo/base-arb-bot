@@ -458,6 +458,9 @@ class RouteOptimizer:
         else:
             final = await self.execution_finalizer.finalize(cycle, amount_in, amount_out, quotes, observed_block)
             execution = final.to_dict()
+            comparison = await self._provider_comparison(cycle, amount_in, amount_out, quotes, observed_block, final)
+            if comparison is not None:
+                execution["provider_comparison"] = comparison
             packed_builder = getattr(self.execution_finalizer, "packed_candidate_dict", None)
             if packed_builder is not None:
                 packed_candidate = packed_builder(cycle, amount_in, amount_out, quotes, final)
@@ -482,6 +485,65 @@ class RouteOptimizer:
             quote_metadata=tuple(q.metadata for q in quotes),
             execution=execution,
         )
+
+    async def _provider_comparison(
+        self, cycle, amount_in, amount_out, quotes, observed_block, primary
+    ) -> dict | None:
+        """Price the same route against the other flash-loan venue, for comparison only.
+
+        Paired by construction -- same cycle, same quotes, same block, same sizing -- so the
+        only variable is the venue. That is what makes a handful of samples informative;
+        alternating providers across different routes would need far more of them to say
+        anything, because route-to-route variance dwarfs a 5bp fee difference.
+
+        Recorded inside the primary row's execution_json rather than as a second
+        route_evaluations row. A second row would have to be joined back to its twin, and
+        would be one forgotten WHERE clause away from being counted as a real candidate.
+
+        Instrumentation must never change the outcome it is measuring: any failure here is
+        swallowed and reported as a field, never raised into the evaluation.
+        """
+        from .execution import FlashProvider
+
+        if not settings.shadow_compare_providers:
+            return None
+        # Never in live trading: it doubles the RPC cost of every evaluation to compute a
+        # number nothing acts on.
+        if not settings.dry_run or settings.live_trading:
+            return None
+        if primary.flash_provider is None:
+            return None
+        try:
+            primary_provider = FlashProvider.parse(primary.flash_provider)
+        except ValueError:
+            return None
+        other = FlashProvider.AAVE if primary_provider is FlashProvider.MORPHO else FlashProvider.MORPHO
+        try:
+            alt = await self.execution_finalizer.finalize(
+                cycle, amount_in, amount_out, quotes, observed_block, provider=other
+            )
+        except Exception as exc:
+            return {"provider": other.name.lower(), "error": f"{type(exc).__name__}: {exc}"}
+
+        delta = None
+        if (
+            alt.deterministic_net_profit_units is not None
+            and primary.deterministic_net_profit_units is not None
+        ):
+            delta = alt.deterministic_net_profit_units - primary.deterministic_net_profit_units
+        return {
+            "provider": other.name.lower(),
+            "baseline_provider": primary.flash_provider,
+            "flashloan_premium_bps": alt.flashloan_premium_bps,
+            "flashloan_premium_units": alt.flashloan_premium_units,
+            "deterministic_net_profit_units": alt.deterministic_net_profit_units,
+            "net_profit_delta_units": delta,
+            "submission_eligible": alt.submission_eligible,
+            # The case the whole exercise is looking for: a route the baseline venue's fee
+            # made unprofitable that the other venue would have cleared.
+            "unblocked_by_switch": bool(alt.submission_eligible and not primary.submission_eligible),
+            "blockers": list(alt.blockers),
+        }
 
     def reject_affected(
         self,
