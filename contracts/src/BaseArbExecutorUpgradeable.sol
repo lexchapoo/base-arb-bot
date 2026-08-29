@@ -84,9 +84,6 @@ contract BaseArbExecutorUpgradeable is IFlashLoanSimpleReceiver, IMorphoFlashLoa
     // Storage, not immutable: an immutable is baked into implementation bytecode and would have
     // to be re-supplied (identically) on every upgrade. Held in the proxy instead.
     IAavePool public POOL;
-    /// Optional second provider. Zero means Morpho routes are refused rather than silently
-    /// falling back to Aave, which would bill a 5bp premium the caller did not ask for.
-    IMorpho public MORPHO;
     address public owner;
     address public pendingOwner;
     mapping(address => bool) public adapterAllowed;
@@ -107,6 +104,20 @@ contract BaseArbExecutorUpgradeable is IFlashLoanSimpleReceiver, IMorphoFlashLoa
     /// committed to has to be carried across the call.
     address private activeAsset;
 
+    /// APPEND-ONLY BELOW THIS LINE.
+    ///
+    /// Everything above was in the deployed layout. A new variable inserted anywhere before
+    /// this point shifts every slot after it, so an upgrade would make `owner` read what
+    /// `pendingOwner` held -- zero on a proxy that never started a handover -- and brick the
+    /// contract beyond recovery, taking the adapter and token allowlists with it. New state
+    /// goes here, at the end, and nowhere else.
+    ///
+    /// Optional second flash-loan provider. Zero means Morpho routes are refused rather than
+    /// silently falling back to Aave, which would bill a 5bp premium the caller did not ask
+    /// for. Zero is also what an upgraded proxy reads until setMorpho() is called: initialize()
+    /// has already run and cannot run again, so this cannot be back-filled by re-initialising.
+    IMorpho public MORPHO;
+
     event RouteExecuted(bytes32 indexed routeHash, address indexed asset, uint256 amount, uint256 premium, uint256 netProfit);
     event PackedRouteExecuted(
         bytes32 indexed batchHash,
@@ -120,6 +131,7 @@ contract BaseArbExecutorUpgradeable is IFlashLoanSimpleReceiver, IMorphoFlashLoa
     event AdapterPermission(address indexed adapter, bool allowed);
     event TokenPermission(address indexed token, bool allowed);
     event PauseChanged(bool paused);
+    event MorphoProviderChanged(address indexed morpho);
     event OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
@@ -182,6 +194,20 @@ contract BaseArbExecutorUpgradeable is IFlashLoanSimpleReceiver, IMorphoFlashLoa
     function setToken(address token, bool allowed) external onlyOwner onlyIdle {
         tokenAllowed[token] = allowed;
         emit TokenPermission(token, allowed);
+    }
+
+    /// Point the executor at a Morpho deployment, or at zero to stop using it.
+    ///
+    /// Needed because this contract is upgradeable: a proxy that predates the second provider
+    /// has already consumed its initializer, so MORPHO can only be populated by a setter. Zero
+    /// is a permitted value -- it is how an operator disables Morpho without an upgrade, and it
+    /// fails closed rather than falling back to Aave.
+    ///
+    /// Grants the owner nothing they did not already have: whoever holds this key can replace
+    /// the entire implementation via _authorizeUpgrade.
+    function setMorpho(address value) external onlyOwner onlyIdle {
+        MORPHO = IMorpho(value);
+        emit MorphoProviderChanged(value);
     }
 
     function setPaused(bool value) external onlyOwner onlyIdle {

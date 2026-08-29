@@ -12,6 +12,52 @@ contract BaseArbExecutorV2 is BaseArbExecutorUpgradeable {
     }
 }
 
+/// The storage layout of the implementation currently behind the live proxy (commit 408c56f),
+/// reproduced exactly and in order.
+///
+/// The existing upgrade test goes from the current implementation to a subclass of it, so both
+/// sides share a layout by construction and it cannot detect a layout change at all. Only an
+/// upgrade *from the deployed shape* can, which is what this exists for. Declaration order here
+/// is load-bearing -- do not tidy it.
+contract LegacyBaseArbExecutor is Initializable, UUPSUpgradeable {
+    IAavePool public POOL;
+    address public owner;
+    address public pendingOwner;
+    mapping(address => bool) public adapterAllowed;
+    mapping(address => bool) public tokenAllowed;
+    mapping(bytes32 => bool) public commitmentUsed;
+    bool public paused;
+
+    bytes32 private activeRouteHash;
+    bytes32 private activeBatchHash;
+    uint256 private activePreLoanBalance;
+    uint256 private activePremium;
+    bytes32 private activeSelectedCandidateId;
+    uint8 private activeSelectedCandidateIndex;
+    uint256 private activeSelectedMinProfit;
+    bool private callbackEntered;
+
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address pool) external initializer {
+        POOL = IAavePool(pool);
+        owner = msg.sender;
+        paused = true;
+    }
+
+    function setAdapter(address adapter, bool allowed) external {
+        adapterAllowed[adapter] = allowed;
+    }
+
+    function setToken(address token, bool allowed) external {
+        tokenAllowed[token] = allowed;
+    }
+
+    function _authorizeUpgrade(address) internal override {}
+}
+
 contract BaseArbExecutorUpgradeableTest {
     function _deploy() internal returns (BaseArbExecutorUpgradeable exec, MockPool pool) {
         pool = new MockPool(10);
@@ -87,10 +133,94 @@ contract BaseArbExecutorUpgradeableTest {
         require(address(exec.POOL()) == address(pool), "POOL lost across upgrade");
         require(exec.paused(), "pause state lost");
     }
+
+    // --- upgrading the live proxy to add the second provider ---------------------------
+
+    /// Simulates the actual mainnet upgrade: deploy the layout that is live today, populate it,
+    /// then move to the current implementation.
+    ///
+    /// This is the test that catches a shifted slot. MORPHO was first declared directly after
+    /// POOL, which put it where `owner` lives; every unit test still passed, because they all
+    /// deploy a fresh contract whose layout is self-consistent. Under this test `owner` comes
+    /// back as the old `pendingOwner` -- zero -- and the proxy is bricked: no unpause, no sweep,
+    /// no second upgrade.
+    function testUpgradeFromTheDeployedLayoutPreservesEveryField() public {
+        MockPool pool = new MockPool(10);
+        MockERC20 tokenA = new MockERC20();
+        MockExchangeAdapter adapter = new MockExchangeAdapter(2, 1);
+
+        LegacyBaseArbExecutor legacyImpl = new LegacyBaseArbExecutor();
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(legacyImpl), abi.encodeCall(LegacyBaseArbExecutor.initialize, (address(pool)))
+        );
+        LegacyBaseArbExecutor legacy = LegacyBaseArbExecutor(address(proxy));
+        legacy.setToken(address(tokenA), true);
+        legacy.setAdapter(address(adapter), true);
+        require(legacy.owner() == address(this), "precondition: owner");
+
+        BaseArbExecutorUpgradeable next = new BaseArbExecutorUpgradeable();
+        legacy.upgradeToAndCall(address(next), "");
+        BaseArbExecutorUpgradeable exec = BaseArbExecutorUpgradeable(address(proxy));
+
+        require(exec.owner() == address(this), "owner moved: layout shifted");
+        require(exec.pendingOwner() == address(0), "pendingOwner moved: layout shifted");
+        require(address(exec.POOL()) == address(pool), "POOL moved: layout shifted");
+        require(exec.paused(), "paused moved: layout shifted");
+        require(exec.tokenAllowed(address(tokenA)), "token allowlist moved: layout shifted");
+        require(exec.adapterAllowed(address(adapter)), "adapter allowlist moved: layout shifted");
+    }
+
+    /// The new slot is fresh storage, so it reads zero on an upgraded proxy -- and initialize()
+    /// is already spent, so it cannot be back-filled by re-initialising. setMorpho is the only
+    /// way in, and until it is called Morpho routes fail closed rather than falling back to Aave.
+    function testUpgradedProxyHasNoMorphoUntilItIsSet() public {
+        MockPool pool = new MockPool(10);
+        LegacyBaseArbExecutor legacyImpl = new LegacyBaseArbExecutor();
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(legacyImpl), abi.encodeCall(LegacyBaseArbExecutor.initialize, (address(pool)))
+        );
+        LegacyBaseArbExecutor(address(proxy)).upgradeToAndCall(
+            address(new BaseArbExecutorUpgradeable()), ""
+        );
+        BaseArbExecutorUpgradeable exec = BaseArbExecutorUpgradeable(address(proxy));
+
+        require(address(exec.MORPHO()) == address(0), "fresh slot must read zero");
+        (bool ok,) = address(exec).call(
+            abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (address(pool), address(0xdead)))
+        );
+        require(!ok, "initialize must stay spent");
+
+        MockMorpho morpho = new MockMorpho();
+        exec.setMorpho(address(morpho));
+        require(address(exec.MORPHO()) == address(morpho), "setMorpho did not take");
+    }
+
+    function testOnlyTheOwnerCanSetMorpho() public {
+        (BaseArbExecutorUpgradeable exec,) = _deploy();
+        Outsider outsider = new Outsider();
+        (bool ok,) = address(outsider).call(
+            abi.encodeCall(Outsider.trySetMorpho, (address(exec), address(0xbeef)))
+        );
+        require(!ok, "non-owner setMorpho must revert");
+        require(address(exec.MORPHO()) == address(0), "MORPHO changed anyway");
+    }
+
+    /// Zero is a permitted value: it is how an operator turns Morpho off without an upgrade.
+    function testMorphoCanBeUnset() public {
+        (BaseArbExecutorUpgradeable exec,) = _deploy();
+        MockMorpho morpho = new MockMorpho();
+        exec.setMorpho(address(morpho));
+        exec.setMorpho(address(0));
+        require(address(exec.MORPHO()) == address(0), "must be able to disable morpho");
+    }
 }
 
 contract Outsider {
     function tryUpgrade(address exec, address impl) external {
         BaseArbExecutorUpgradeable(exec).upgradeToAndCall(impl, "");
+    }
+
+    function trySetMorpho(address exec, address morpho) external {
+        BaseArbExecutorUpgradeable(exec).setMorpho(morpho);
     }
 }
