@@ -26,7 +26,7 @@ rust-test:
 
 solidity-test:
 	@command -v forge >/dev/null || { echo 'ERROR: forge not installed. Install Foundry, then rerun.' >&2; exit 127; }
-	@cd contracts && forge build && forge test --no-match-path 'test/BaseMainnetFork.t.sol' -vvv
+	@cd contracts && forge build && forge test --no-match-path 'test/*Fork.t.sol' -vvv
 
 codex-check:
 	@bash scripts/codex_check.sh

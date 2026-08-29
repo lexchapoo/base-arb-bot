@@ -21,5 +21,5 @@ else
   python3 -m pytest -q python/tests
 fi
 if command -v cargo >/dev/null; then (cd rust-executor && cargo test); else echo 'NOT RUN: cargo test (cargo missing)'; fi
-if command -v forge >/dev/null; then (cd contracts && forge build && forge test --no-match-path 'test/BaseMainnetFork.t.sol' -vvv); else echo 'NOT RUN: forge tests (forge missing)'; fi
+if command -v forge >/dev/null; then (cd contracts && forge build && forge test --no-match-path 'test/*Fork.t.sol' -vvv); else echo 'NOT RUN: forge tests (forge missing)'; fi
 echo 'Codex preflight complete.'
