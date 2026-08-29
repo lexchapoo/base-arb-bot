@@ -101,6 +101,28 @@ class VerifiedPoolRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class CuratedPoolRecord(Base):
+    """The operator-selected pool set the router is meant to run on.
+
+    Separate from `verified_pools` on purpose: that table is the full discovery output
+    (~28.6k rows on Base), while this is the small liquid subset curation chose. Keeping
+    it durable is what makes a selection survive a restart when automatic discovery --
+    which would otherwise rehydrate the graph -- is switched off.
+    """
+
+    __tablename__ = "curated_pools"
+    address: Mapped[str] = mapped_column(String(42), primary_key=True)
+    token0: Mapped[str] = mapped_column(String(42), index=True)
+    token1: Mapped[str] = mapped_column(String(42), index=True)
+    venue: Mapped[str] = mapped_column(String(32))
+    pool_type: Mapped[str] = mapped_column(String(32))
+    fee: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    tick_spacing: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class DiscoveryCheckpointRecord(Base):
     __tablename__ = "discovery_checkpoints"
     source: Mapped[str] = mapped_column(String(32), primary_key=True)

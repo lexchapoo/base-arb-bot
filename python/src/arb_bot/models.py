@@ -1,6 +1,8 @@
 from __future__ import annotations
 from decimal import Decimal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .event_graph import canonical_venue
 
 
 def _address(value: str) -> str:
@@ -63,11 +65,31 @@ class PoolRegistration(BaseModel):
     pool_type: str
     fee: int | None = Field(default=None, ge=0)
     stable: bool | None = None
+    # Slipstream's pool key. Quoting rejects a Slipstream pool without it (route_engine
+    # raises missing_tick_spacing), so a registration that omits it produces a pool that
+    # is in the graph but can never be routed through -- silently dead weight.
+    tick_spacing: int | None = None
 
     @field_validator("address", "token0", "token1")
     @classmethod
     def valid_address(cls, value: str) -> str:
         return _address(value)
+
+    @model_validator(mode="after")
+    def routing_key_present(self) -> "PoolRegistration":
+        """Reject registrations the quoter would refuse to route through.
+
+        Failing at the API boundary turns an unusable pool into a 422 the caller can see,
+        instead of a graph entry that only reveals itself as dead at evaluation time.
+        """
+        venue = canonical_venue(self.venue)
+        if venue == "aerodrome-slipstream" and self.tick_spacing is None:
+            raise ValueError("aerodrome-slipstream pools require tick_spacing")
+        if venue == "uniswap-v3" and self.fee is None:
+            raise ValueError("uniswap-v3 pools require fee")
+        if venue == "aerodrome" and self.stable is None:
+            raise ValueError("aerodrome pools require stable")
+        return self
 
 
 class PendingLogTrigger(BaseModel):

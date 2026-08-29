@@ -1,8 +1,17 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# `.env` resolves against the process working directory, so what the service loads depends
+# on where it was started from. That is fine for the container (it starts in the app root)
+# and actively harmful for the test suite, whose results silently changed depending on
+# whether pytest ran from the repo root or from python/. ARB_BOT_ENV_FILE makes the choice
+# explicit; the tests point it at a path that does not exist.
+ENV_FILE = os.environ.get("ARB_BOT_ENV_FILE", ".env")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
     chain_id: int = 8453
     base_http_rpc: str = "https://mainnet.base.org"
     base_http_rpcs: str = ""
@@ -45,18 +54,45 @@ class Settings(BaseSettings):
     # 0 disables refinement.
     size_refinement_points: int = 4
     rust_executor_url: str = "http://localhost:8081"
+    # Block tag every quote and balance read in the sizing path is priced against.
+    #
+    # "pending" is the production setting and the premise of the whole strategy: routes are
+    # priced against Base Flashblocks pre-confirmation state, which is what makes the edge
+    # available at all. "latest" prices confirmed state instead -- strictly worse
+    # information, and it forfeits that edge -- but a node that cannot serve `pending`
+    # quickly makes every quote time out, and a slow correct answer is worth less than a
+    # fast approximate one when the alternative is no answer. Only widen this to "latest"
+    # deliberately, and expect the results to describe a market one block behind the one
+    # you would actually trade into.
+    quote_block_tag: str = "pending"
     quote_timeout_seconds: float = 4.0
     execution_rpc_timeout_seconds: float = 8.0
     uniswap_v3_quoter_v2: str = ""
     aerodrome_router: str = ""
     aerodrome_factory: str = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
     uniswap_v3_factory: str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+    # Shared secret required by the pool-curation endpoints, which replace the durable
+    # curated set and the live routing graph. Empty means those endpoints are refused
+    # outright: an unauthenticated caller able to reach the port could otherwise redirect
+    # route evaluation onto pools of their choosing, or empty the graph and halt trading.
+    operator_api_token: str = ""
     auto_pool_discovery_enabled: bool = True
     pool_discovery_refresh_seconds: int = 60
     pool_discovery_from_block: int = 0
     pool_discovery_log_chunk_blocks: int = 20_000
     pool_discovery_concurrency: int = 16
     pool_discovery_token_allowlist: str = ""
+    # Separate endpoint for discovery's verification eth_calls (get_code/token0/factory).
+    # Log reads need history, verification only needs a synced head, and the verification
+    # fan-out is what actually trips rate limits -- so pointing this at a local node while
+    # BASE_HTTP_RPC stays on an archive provider is the configuration that scales. Empty
+    # means "same endpoint as the log reads", which is the previous behaviour.
+    pool_discovery_call_rpc_url: str = ""
+    # Split-RPC discovery only: how far the verification endpoint may trail the log
+    # endpoint before its get_code/token0 answers are treated as untrustworthy. A lagging
+    # node reports recently created pools as non-existent, which silently drops them.
+    # Inert unless pool_discovery_call_rpc_url is set: with one endpoint there is no lag.
+    pool_discovery_max_call_lag_blocks: int = 64
     executor_address: str = ""
     executor_owner_address: str = ""
     aave_pool: str = ""
@@ -74,3 +110,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.quote_block_tag not in {"pending", "latest"}:
+    raise ValueError(
+        f"QUOTE_BLOCK_TAG must be 'pending' or 'latest', got {settings.quote_block_tag!r}"
+    )

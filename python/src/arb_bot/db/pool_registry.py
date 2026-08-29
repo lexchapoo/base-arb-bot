@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from ..event_graph import PoolMetadata
-from .models import DiscoveryCheckpointRecord, VerifiedPoolRecord
+from .models import CuratedPoolRecord, DiscoveryCheckpointRecord, VerifiedPoolRecord
 from .session import SessionLocal
 
 
@@ -75,3 +75,67 @@ class PostgresPoolRegistry:
                 )
             )
             await db.commit()
+
+
+class PostgresCuratedPoolStore:
+    """Durable store for the operator-selected pool set (see CuratedPoolRecord)."""
+
+    @staticmethod
+    def _to_metadata(row: CuratedPoolRecord) -> PoolMetadata:
+        return PoolMetadata.create(
+            address=row.address,
+            token0=row.token0,
+            token1=row.token1,
+            venue=row.venue,
+            pool_type=row.pool_type,
+            fee=row.fee,
+            stable=row.stable,
+            tick_spacing=row.tick_spacing,
+        )
+
+    @staticmethod
+    def _to_record(pool: PoolMetadata) -> CuratedPoolRecord:
+        return CuratedPoolRecord(
+            address=pool.address,
+            token0=pool.token0,
+            token1=pool.token1,
+            venue=pool.venue,
+            pool_type=pool.pool_type,
+            fee=pool.fee,
+            stable=pool.stable,
+            tick_spacing=pool.tick_spacing,
+        )
+
+    async def load(self) -> list[PoolMetadata]:
+        async with SessionLocal() as db:
+            rows = (await db.execute(select(CuratedPoolRecord))).scalars().all()
+            return [self._to_metadata(row) for row in rows]
+
+    async def add(self, pool: PoolMetadata) -> None:
+        async with SessionLocal() as db:
+            await db.merge(self._to_record(pool))
+            await db.commit()
+
+    async def remove(self, address: str) -> bool:
+        key = PoolMetadata.normalize_address(address)
+        async with SessionLocal() as db:
+            result = await db.execute(
+                delete(CuratedPoolRecord).where(CuratedPoolRecord.address == key)
+            )
+            await db.commit()
+            return bool(result.rowcount)
+
+    async def replace(self, pools: Iterable[PoolMetadata]) -> int:
+        """Make `pools` the whole curated set in one transaction.
+
+        Delete-then-insert rather than upsert: a selection is a set, so pools the new
+        curation pass dropped must actually disappear. Both halves commit together, so a
+        failure cannot leave the table emptied.
+        """
+        materialised = list(pools)
+        async with SessionLocal() as db:
+            await db.execute(delete(CuratedPoolRecord))
+            for pool in materialised:
+                db.add(self._to_record(pool))
+            await db.commit()
+            return len(materialised)

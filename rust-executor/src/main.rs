@@ -112,6 +112,11 @@ struct SubmitResponse {
     provider: String,
     tx_hash: Option<String>,
     latency_ms: u128,
+    /// Which RPC-consensus axes actually held for the simulation this submission was
+    /// gated on (see `ConsensusCall::pending_agreement`). A structured field rather than
+    /// prose in `message`, because the live path is exactly where a caller needs to record
+    /// that the trade was priced on an unverified pending view.
+    consensus: &'static str,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -516,6 +521,48 @@ fn consensus_requested() -> bool {
     env::var("RPC_CONSENSUS_REQUIRED").unwrap_or_else(|_| "true".into()).eq_ignore_ascii_case("true")
 }
 
+/// How hard the pending-state cross-check is enforced when consensus is required.
+///
+/// `pending` is provider-local by construction -- each node has its own mempool and its own
+/// Flashblock tip -- so byte-equality across two independent providers is not something a
+/// generic deployment can require. But leaving the decision state entirely unchecked, as the
+/// sealed-block cross-check alone did, means `RPC_CONSENSUS_REQUIRED=true` verified only that
+/// the providers describe the same chain, never that they agree about the state the trade was
+/// actually priced against. These modes make that choice explicit instead of implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingConsensusMode {
+    /// Sealed-block agreement only (the pre-existing behaviour).
+    Off,
+    /// Cross-check `pending` on the second provider and report divergence, but proceed.
+    Observe,
+    /// Require byte-equal `pending` results. Correct only where both endpoints share a
+    /// mempool view (e.g. two nodes peered to the same sequencer feed); anywhere else this
+    /// rejects nearly every real opportunity, which is why it is not the default.
+    Strict,
+}
+
+fn pending_consensus_mode() -> PendingConsensusMode {
+    match env::var("RPC_CONSENSUS_PENDING_MODE")
+        .unwrap_or_else(|_| "observe".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "false" => PendingConsensusMode::Off,
+        "strict" => PendingConsensusMode::Strict,
+        _ => PendingConsensusMode::Observe,
+    }
+}
+
+/// The result of a consensus-checked `eth_call`, plus what was actually verified about it.
+#[derive(Debug, Clone)]
+struct ConsensusCall {
+    /// The primary provider's result at the requested tag -- the value the decision uses.
+    value: Value,
+    /// Machine-readable statement of the guarantee obtained, surfaced in the submission
+    /// response so "consensus required" is never reported as more than it proved.
+    pending_agreement: &'static str,
+}
+
 fn rpc_probe_timeout() -> Duration {
     let secs: f64 = env::var("RPC_PROBE_TIMEOUT_SECONDS")
         .ok()
@@ -602,42 +649,110 @@ async fn select_rpc_endpoints(expected_chain: u128) -> Result<Vec<RpcProbe>, Str
     Ok(probes)
 }
 
-/// Simulate against the primary endpoint at `tag` (normally `pending`), and — when consensus is
-/// required — cross-check a *second* endpoint at a **fixed block tag**.
+/// Simulate against the primary endpoint at `tag` (normally `pending`) and, when consensus is
+/// required, cross-check a *second* endpoint on two separate axes:
 ///
-/// Pending state is inherently provider-local: each node has its own mempool view and its own
-/// Flashblock tip, so byte-comparing two providers' `pending` results rejects nearly every real
-/// opportunity. Agreement is only meaningful on a block both nodes have actually sealed, so the
-/// cross-check runs against `consensus_block` (the highest block all probes have in common).
-async fn consensus_eth_call(probes: &[RpcProbe], tx: Value, tag: &str) -> Result<Value, String> {
+/// 1. **Chain agreement** at `consensus_block` (the highest block every probe has sealed). Both
+///    providers must return identical bytes there. This is deterministic and always enforced.
+/// 2. **Decision-state agreement** at `tag` itself, governed by `RPC_CONSENSUS_PENDING_MODE`.
+///    Axis 1 alone says nothing about the pending state the trade was priced against -- two
+///    providers can agree perfectly on sealed history while holding completely different
+///    mempools -- so without this the "consensus" guarantee stopped short of the only state
+///    that determines whether the trade is profitable.
+///
+/// Pending state is provider-local by construction, so exact agreement cannot be the default
+/// requirement (see `PendingConsensusMode`). What is always true after this returns is that the
+/// caller is told, via `pending_agreement`, exactly which of the two axes held.
+async fn consensus_eth_call(probes: &[RpcProbe], tx: Value, tag: &str) -> Result<ConsensusCall, String> {
     let primary = probes.first().ok_or_else(|| "no healthy RPC endpoint".to_string())?;
     let body = rpc_call(&primary.url, "eth_call", serde_json::json!([tx.clone(), tag])).await?;
     let primary_value = rpc_result_value(&body)?.clone();
 
     if !consensus_requested() || probes.len() < 2 {
-        return Ok(primary_value);
+        return Ok(ConsensusCall { value: primary_value, pending_agreement: "unverified_single_provider" });
     }
 
+    let secondary = &probes[1];
     // Highest block every probe reported, so both sides address identical, already-sealed state.
     let consensus_block = probes.iter().map(|p| p.block_number).min().unwrap_or(0);
     let block_tag = format!("0x{consensus_block:x}");
-    let mut agreed: Option<Value> = None;
-    for p in probes.iter().take(2) {
-        let body = rpc_call(&p.url, "eth_call", serde_json::json!([tx.clone(), block_tag])).await?;
-        let value = rpc_result_value(&body)?.clone();
-        match agreed {
-            Some(ref expected) if expected != &value => {
+    let mode = pending_consensus_mode();
+
+    // All three cross-checks issued together: this sits on the submission hot path and the
+    // adaptive gate charges elapsed time against `survival_window_ms`, so serialising them
+    // would spend survival budget for no extra information.
+    let (primary_sealed, secondary_sealed, secondary_pending) = tokio::join!(
+        rpc_call(&primary.url, "eth_call", serde_json::json!([tx.clone(), block_tag.clone()])),
+        rpc_call(&secondary.url, "eth_call", serde_json::json!([tx.clone(), block_tag.clone()])),
+        async {
+            match mode {
+                PendingConsensusMode::Off => None,
+                _ => Some(rpc_call(&secondary.url, "eth_call", serde_json::json!([tx.clone(), tag])).await),
+            }
+        },
+    );
+
+    let primary_sealed_body = primary_sealed?;
+    let secondary_sealed_body = secondary_sealed?;
+    let primary_sealed_value = rpc_result_value(&primary_sealed_body)?;
+    let secondary_sealed_value = rpc_result_value(&secondary_sealed_body)?;
+    if primary_sealed_value != secondary_sealed_value {
+        return Err(format!(
+            "critical eth_call disagreed across RPC providers at block {consensus_block}"
+        ));
+    }
+
+    let pending_agreement = match secondary_pending {
+        None => "sealed_block_only",
+        Some(Err(e)) => {
+            // The premise of consensus is that a second opinion is obtainable. In strict mode
+            // an unreachable second provider is a failure, not a silent downgrade.
+            if mode == PendingConsensusMode::Strict {
                 return Err(format!(
-                    "critical eth_call disagreed across RPC providers at block {consensus_block}"
+                    "RPC_CONSENSUS_PENDING_MODE=strict but the pending cross-check failed on {}: {e}",
+                    secondary.url
                 ));
             }
-            Some(_) => {}
-            None => agreed = Some(value),
+            warn!(url=%secondary.url, %e, "pending-state cross-check unavailable; sealed-block agreement only");
+            "pending_cross_check_unavailable"
         }
-    }
-    // The submitted transaction is still governed by the `tag` simulation; the fixed-block
-    // agreement only proves the providers describe the same chain.
-    Ok(primary_value)
+        Some(Ok(body)) => match rpc_result_value(&body) {
+            Ok(value) if *value == primary_value => "pending_exact_match",
+            Ok(_) => {
+                if mode == PendingConsensusMode::Strict {
+                    return Err(format!(
+                        "pending-state eth_call disagreed across RPC providers (primary={} secondary={})",
+                        primary.url, secondary.url
+                    ));
+                }
+                warn!(
+                    primary=%primary.url, secondary=%secondary.url,
+                    "providers disagree on pending-state simulation; submitting on the primary's view"
+                );
+                "pending_divergent"
+            }
+            Err(e) => {
+                // The primary simulated successfully and the secondary reverted. Usually just a
+                // different mempool ordering, but it is the exact shape a stale primary would
+                // also take, so it is never swallowed silently.
+                if mode == PendingConsensusMode::Strict {
+                    return Err(format!(
+                        "pending-state eth_call reverted on {} while succeeding on {}: {e}",
+                        secondary.url, primary.url
+                    ));
+                }
+                warn!(
+                    primary=%primary.url, secondary=%secondary.url, %e,
+                    "pending-state simulation reverted on the cross-check provider"
+                );
+                "pending_reverted_on_secondary"
+            }
+        },
+    };
+
+    // The submitted transaction is still governed by the primary's `tag` simulation; the
+    // caller is told which cross-checks backed it.
+    Ok(ConsensusCall { value: primary_value, pending_agreement })
 }
 
 fn stamp_pool_state(state: &mut ChainState, trigger: &mut PendingLogTrigger) {
@@ -795,10 +910,14 @@ async fn submit_plan(State(state): State<Arc<RwLock<ChainState>>>, Json(req): Js
             accepted: true,
             dry_run: true,
             submission_id: id,
-            message: format!("exact pending-state executor eth_call passed: {}", sim_result.as_str().unwrap_or("0x")),
+            message: format!(
+                "exact pending-state executor eth_call passed: {}",
+                sim_result.value.as_str().unwrap_or("0x")
+            ),
             provider,
             tx_hash: None,
             latency_ms: start.elapsed().as_millis(),
+            consensus: sim_result.pending_agreement,
         }));
     }
 
@@ -943,6 +1062,7 @@ async fn submit_plan(State(state): State<Arc<RwLock<ChainState>>>, Json(req): Js
         provider,
         tx_hash: Some(tx_hash),
         latency_ms: start.elapsed().as_millis(),
+        consensus: sim_result.pending_agreement,
     }))
 }
 
@@ -1014,6 +1134,9 @@ async fn submit(Json(req): Json<SubmitRequest>) -> Result<Json<SubmitResponse>, 
             provider,
             tx_hash: None,
             latency_ms: start.elapsed().as_millis(),
+            // This legacy /submit path simulates against a single endpoint and never runs
+            // the consensus checks; say so rather than leaving the field ambiguous.
+            consensus: "unverified_single_provider",
         }));
     }
 
@@ -1366,6 +1489,43 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+
+#[cfg(test)]
+mod consensus_tests {
+    use super::*;
+
+    #[test]
+    fn pending_consensus_mode_defaults_to_observe() {
+        std::env::remove_var("RPC_CONSENSUS_PENDING_MODE");
+        assert_eq!(pending_consensus_mode(), PendingConsensusMode::Observe);
+    }
+
+    #[test]
+    fn pending_consensus_mode_parses_every_documented_value() {
+        for (raw, expected) in [
+            ("off", PendingConsensusMode::Off),
+            ("false", PendingConsensusMode::Off),
+            ("OFF", PendingConsensusMode::Off),
+            ("strict", PendingConsensusMode::Strict),
+            ("Strict", PendingConsensusMode::Strict),
+            ("observe", PendingConsensusMode::Observe),
+            // Anything unrecognised must fail towards the checked-but-permissive mode,
+            // never towards silently skipping the pending cross-check.
+            ("nonsense", PendingConsensusMode::Observe),
+        ] {
+            std::env::set_var("RPC_CONSENSUS_PENDING_MODE", raw);
+            assert_eq!(pending_consensus_mode(), expected, "for {raw}");
+        }
+        std::env::remove_var("RPC_CONSENSUS_PENDING_MODE");
+    }
+
+    #[tokio::test]
+    async fn single_provider_call_reports_that_nothing_was_cross_checked() {
+        // No probes at all is the only case that can be exercised without a live endpoint;
+        // it must be an error rather than a silently "verified" result.
+        assert!(consensus_eth_call(&[], serde_json::json!({}), "pending").await.is_err());
+    }
+}
 
 #[cfg(test)]
 mod adaptive_tests {

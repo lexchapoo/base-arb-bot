@@ -80,6 +80,21 @@ CREATE INDEX IF NOT EXISTS ix_verified_pools_factory ON verified_pools(factory);
 CREATE INDEX IF NOT EXISTS ix_verified_pools_token0 ON verified_pools(token0);
 CREATE INDEX IF NOT EXISTS ix_verified_pools_token1 ON verified_pools(token1);
 
+CREATE TABLE IF NOT EXISTS curated_pools (
+  address VARCHAR(42) PRIMARY KEY,
+  token0 VARCHAR(42) NOT NULL,
+  token1 VARCHAR(42) NOT NULL,
+  venue VARCHAR(32) NOT NULL,
+  pool_type VARCHAR(32) NOT NULL,
+  fee INTEGER,
+  stable BOOLEAN,
+  tick_spacing INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_curated_pools_token0 ON curated_pools(token0);
+CREATE INDEX IF NOT EXISTS ix_curated_pools_token1 ON curated_pools(token1);
+
 CREATE TABLE IF NOT EXISTS discovery_checkpoints (
   source VARCHAR(32) PRIMARY KEY,
   factory VARCHAR(42) NOT NULL,

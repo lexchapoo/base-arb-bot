@@ -19,6 +19,22 @@ _STATEMENTS = [
     "ALTER TABLE opportunity_telemetry ADD COLUMN IF NOT EXISTS shadow_features_json TEXT NOT NULL DEFAULT '{}'",
     "CREATE INDEX IF NOT EXISTS ix_opportunity_telemetry_route_family ON opportunity_telemetry(route_family)",
     "CREATE INDEX IF NOT EXISTS ix_opportunity_telemetry_shadow_action ON opportunity_telemetry(shadow_action)",
+    # Durable home for the curated (operator-selected) pool set, so it survives a restart
+    # with AUTO_POOL_DISCOVERY_ENABLED=false.
+    """CREATE TABLE IF NOT EXISTS curated_pools (
+         address VARCHAR(42) PRIMARY KEY,
+         token0 VARCHAR(42) NOT NULL,
+         token1 VARCHAR(42) NOT NULL,
+         venue VARCHAR(32) NOT NULL,
+         pool_type VARCHAR(32) NOT NULL,
+         fee INTEGER,
+         stable BOOLEAN,
+         tick_spacing INTEGER,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+       )""",
+    "CREATE INDEX IF NOT EXISTS ix_curated_pools_token0 ON curated_pools(token0)",
+    "CREATE INDEX IF NOT EXISTS ix_curated_pools_token1 ON curated_pools(token1)",
 ]
 
 async def migrate_v012() -> None:

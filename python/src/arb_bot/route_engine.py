@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from .adapters.base import Quote, QuoteAdapter
 from .config import settings
-from .event_graph import Cycle, LivePoolGraph, PoolMetadata
+from .event_graph import Cycle, LivePoolGraph, PoolMetadata, canonical_venue
 from .execution import ExecutionFinalizer
 
 ERC20_BALANCE_ABI = [{
@@ -68,16 +68,8 @@ class AdapterRegistry:
                 "aerodrome",
             )
 
-    @staticmethod
-    def canonical_venue(venue: str) -> str:
-        v = venue.strip().lower()
-        if "slipstream" in v:
-            return "aerodrome-slipstream"
-        if "uniswap" in v:
-            return "uniswap-v3"
-        if "aerodrome" in v:
-            return "aerodrome"
-        return v
+    #: Single definition, shared with the API request models (see event_graph.canonical_venue).
+    canonical_venue = staticmethod(canonical_venue)
 
     def get(self, venue: str) -> QuoteAdapter | None:
         return self._adapters.get(self.canonical_venue(venue))
@@ -93,7 +85,8 @@ class LiveBalanceProvider:
         # Preserved for callers/tests that reach for a single client.
         self.w3 = self.providers._clients[0]
 
-    async def token_balance(self, token: str, account: str, block_identifier: str = "pending") -> int:
+    async def token_balance(self, token: str, account: str, block_identifier: str | None = None) -> int:
+        block_identifier = block_identifier or settings.quote_block_tag
         # This is the fallback path taken when the multicall prefetch did not supply the balance,
         # so it runs precisely when the provider is already under pressure. Failing over to the
         # next endpoint keeps a rate limit from turning into `live_balance_query_failed`, which
@@ -142,13 +135,14 @@ class RouteOptimizer:
     @staticmethod
     def _pool_kwargs(pool: PoolMetadata) -> dict:
         venue = AdapterRegistry.canonical_venue(pool.venue)
+        tag = settings.quote_block_tag
         if venue == "uniswap-v3":
-            return {"fee": pool.fee, "block_identifier": "pending"}
+            return {"fee": pool.fee, "block_identifier": tag}
         if venue == "aerodrome-slipstream":
-            return {"tick_spacing": pool.tick_spacing, "block_identifier": "pending"}
+            return {"tick_spacing": pool.tick_spacing, "block_identifier": tag}
         if venue == "aerodrome":
-            return {"stable": pool.stable, "block_identifier": "pending"}
-        return {"block_identifier": "pending"}
+            return {"stable": pool.stable, "block_identifier": tag}
+        return {"block_identifier": tag}
 
     async def _quote_cycle(self, cycle: Cycle, amount_in: int) -> tuple[int, list[Quote]]:
         amount = amount_in
@@ -235,7 +229,7 @@ class RouteOptimizer:
             account = pool.lower().removeprefix("0x").rjust(64, "0")
             calls.append((token, bytes.fromhex("70a08231" + account)))  # balanceOf(address)
         try:
-            results = await self._multicall().aggregate3(calls, "pending")
+            results = await self._multicall().aggregate3(calls, settings.quote_block_tag)
         except Exception:
             return {}
         balances: dict[tuple[str, str], int] = {}
@@ -283,7 +277,9 @@ class RouteOptimizer:
             token_out = cycle.tokens[hop + 1]
             calls = [adapter.encode_quote(token_in, token_out, current[i], **kwargs) for i in surviving]
             try:
-                results = await mc.aggregate3(calls, block_identifier=kwargs.get("block_identifier", "pending"))
+                results = await mc.aggregate3(
+                    calls, block_identifier=kwargs.get("block_identifier", settings.quote_block_tag)
+                )
             except Exception as exc:
                 return {}, [f"multicall_failed:{type(exc).__name__}"]
             next_surviving: list[int] = []
@@ -357,7 +353,9 @@ class RouteOptimizer:
                         _urls,
                         attempt_timeout_seconds=settings.quote_timeout_seconds / max(1, 2 * len(_urls)),
                     )
-                upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
+                upper = await self.balance_provider.token_balance(
+                    token_in, first_pool.address, settings.quote_block_tag
+                )
             except Exception as exc:
                 return None, None, [], [f"live_balance_query_failed:{type(exc).__name__}"]
         if upper <= 0:
