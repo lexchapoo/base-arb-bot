@@ -117,6 +117,58 @@ contract BaseProxyUpgradeForkTest {
         require(exec.paused(), "setMorpho disturbed pause state");
     }
 
+    /// Upgrade and configure in ONE transaction, by passing setMorpho calldata as the
+    /// upgradeToAndCall payload.
+    ///
+    /// upgradeToAndCall delegatecalls `data` against the *new* implementation immediately after
+    /// switching the pointer, and delegatecall preserves msg.sender -- so setMorpho's onlyOwner
+    /// sees the owner who sent the upgrade, not the proxy. That removes the window in which the
+    /// proxy is upgraded but MORPHO is still zero, and it is why the payload does not have to be
+    /// empty: `initialize` is spent, but an ordinary owner function is not.
+    function testUpgradeAndSetMorphoInOneTransaction() public {
+        BaseArbExecutorUpgradeable next = new BaseArbExecutorUpgradeable();
+        vm.prank(OWNER);
+        BaseArbExecutorUpgradeable(PROXY).upgradeToAndCall(
+            address(next), abi.encodeCall(BaseArbExecutorUpgradeable.setMorpho, (MORPHO))
+        );
+        BaseArbExecutorUpgradeable exec = BaseArbExecutorUpgradeable(PROXY);
+
+        require(address(exec.MORPHO()) == MORPHO, "atomic setMorpho did not take");
+        require(exec.owner() == OWNER, "owner lost");
+        require(address(exec.POOL()) == AAVE_POOL, "POOL lost");
+        require(exec.paused(), "pause state lost");
+        require(exec.implementation() == address(next), "implementation did not move");
+    }
+
+    /// The payload runs as the caller, so a non-owner cannot smuggle setMorpho through it --
+    /// and cannot upgrade at all, which is the outer guard.
+    function testNonOwnerCannotUpgradeWithAPayload() public {
+        BaseArbExecutorUpgradeable next = new BaseArbExecutorUpgradeable();
+        (bool ok,) = PROXY.call(
+            abi.encodeWithSignature(
+                "upgradeToAndCall(address,bytes)",
+                address(next),
+                abi.encodeCall(BaseArbExecutorUpgradeable.setMorpho, (MORPHO))
+            )
+        );
+        require(!ok, "non-owner upgrade must revert");
+    }
+
+    /// Re-running initialize as the payload must still fail: it is spent, and an upgrade that
+    /// appeared to succeed while silently skipping configuration would be worse than a revert.
+    function testInitializeAsThePayloadStillReverts() public {
+        BaseArbExecutorUpgradeable next = new BaseArbExecutorUpgradeable();
+        vm.prank(OWNER);
+        (bool ok,) = PROXY.call(
+            abi.encodeWithSignature(
+                "upgradeToAndCall(address,bytes)",
+                address(next),
+                abi.encodeCall(BaseArbExecutorUpgradeable.initialize, (AAVE_POOL, MORPHO))
+            )
+        );
+        require(!ok, "initialize must stay spent even as an upgrade payload");
+    }
+
     function testSetMorphoIsOwnerOnlyOnTheLiveProxy() public {
         BaseArbExecutorUpgradeable exec = _upgrade();
         (bool ok,) = PROXY.call(abi.encodeCall(BaseArbExecutorUpgradeable.setMorpho, (MORPHO)));

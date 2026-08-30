@@ -80,6 +80,94 @@ def transaction(nonce: int, purpose: str, to: str | None, data: bytes | str) -> 
     return {"nonce": nonce, "purpose": purpose, "to": to, "value": "0x0", "data": encoded}
 
 
+def upgrade_plan(*, proxy: str, deployer: str, owner: str, morpho: str,
+                 implementation: str, nonce: int) -> dict[str, Any]:
+    """Upgrade an already-deployed UUPS proxy in place, in two independently estimable phases.
+
+    Phase 1 (no --implementation) deploys the new logic contract and nothing else. Phase 2
+    passes that address back in and emits the single upgrade call.
+
+    Split, rather than one plan of two transactions, because `upgradeToAndCall` cannot be
+    estimated while its target implementation does not yet exist: ERC1967 reverts with
+    ERC1967InvalidImplementation, and a plan whose next transaction cannot be estimated is
+    exactly what the signer refuses to guess a gas limit for.
+
+    Phase 2 is a *single* transaction that both upgrades and configures. upgradeToAndCall
+    delegatecalls its payload against the new implementation immediately after moving the
+    pointer, and delegatecall preserves msg.sender, so setMorpho's onlyOwner sees the owner who
+    sent the upgrade. That leaves no window in which the proxy is upgraded but MORPHO is still
+    zero -- a window in which every Morpho route would revert.
+
+    The payload is deliberately not `initialize`: that is spent on a live proxy and would revert,
+    taking the upgrade with it.
+    """
+    if implementation and implementation.lower() == proxy.lower():
+        raise SystemExit("--implementation must not be the proxy itself")
+    if not implementation:
+        return {
+            "chain_id": 8453,
+            "broadcast": False,
+            "activation_state": "unchanged",
+            "admin_only": False,
+            "deployer": deployer,
+            "intended_owner": owner,
+            "starting_nonce": nonce,
+            "upgrade_target": proxy,
+            "upgrade_phase": 1,
+            "predicted_addresses": {"implementation": create_address(deployer, nonce)},
+            "init_code_hashes": {},
+            "transactions": [
+                transaction(
+                    nonce, "deploy BaseArbExecutorUpgradeable implementation", None,
+                    init_code("BaseArbExecutorUpgradeable.sol", "BaseArbExecutorUpgradeable", [], []),
+                )
+            ],
+            "postconditions": [
+                "this plan touches no proxy: it only puts new logic on chain, inert until pointed at",
+                "verify the deployed implementation's owner() is zero -- a bare implementation "
+                "must not be initializable, or whoever initializes it owns it and can upgrade it",
+                "record the deployed address and re-run with --implementation <address> for phase 2",
+            ],
+        }
+
+    # Phase 2. The payload runs as the owner via delegatecall; see the docstring.
+    payload = call_data("setMorpho(address)", ["address"], [morpho])
+    return {
+        "chain_id": 8453,
+        "broadcast": False,
+        "activation_state": "unchanged",
+        "admin_only": True,
+        "deployer": deployer,
+        "intended_owner": owner,
+        "starting_nonce": nonce,
+        "upgrade_target": proxy,
+        "upgrade_phase": 2,
+        "implementation_predeployed": True,
+        "predicted_addresses": {"executor": proxy, "implementation": implementation},
+        "init_code_hashes": {},
+        "transactions": [
+            transaction(
+                nonce, "upgradeToAndCall(implementation, setMorpho) on the live proxy", proxy,
+                call_data(
+                    "upgradeToAndCall(address,bytes)", ["address", "bytes"],
+                    [implementation, bytes.fromhex(payload[2:])],
+                ),
+            )
+        ],
+        "postconditions": [
+            f"verify executor.owner() is still {owner} -- that read is what proves the storage "
+            "layout survived; a shifted layout returns the old pendingOwner, usually zero",
+            "verify executor.POOL() is unchanged",
+            "verify executor.paused() is unchanged -- a shifted layout can also silently unpause",
+            f"verify executor.MORPHO() is {morpho}",
+            "verify executor.implementation() is the address deployed in phase 1",
+            "run scripts_verify_runtime.py with FLASH_PROVIDER=morpho; it must exit 0",
+            "the signer must BE the owner: upgradeToAndCall is onlyOwner, so a mismatch shows up "
+            "as a failed gas estimate rather than a wasted nonce",
+        ],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployer", default=os.environ.get("EXTERNAL_SIGNER_ADDRESS", ""))
@@ -100,6 +188,12 @@ def main() -> int:
              "the second phase of a proxy deployment: the plan then starts at the ERC1967 proxy, "
              "so every transaction in it can be estimated against real chain state. Requires "
              "--upgradeable.",
+    )
+    parser.add_argument(
+        "--upgrade-proxy", default="",
+        help="address of an ALREADY-DEPLOYED ERC1967 proxy to upgrade in place. Two phases, "
+             "each independently estimable: run it alone to emit the implementation deploy, "
+             "then again with --implementation <deployed> to emit the upgrade itself.",
     )
     parser.add_argument(
         "--upgradeable", action="store_true",
@@ -135,8 +229,20 @@ def main() -> int:
     if not allowed_tokens:
         raise SystemExit("DEPLOY_ALLOWED_TOKENS must contain at least one verified token")
 
-    if args.implementation and not args.upgradeable:
-        raise SystemExit("--implementation requires --upgradeable")
+    if args.implementation and not (args.upgradeable or args.upgrade_proxy):
+        raise SystemExit("--implementation requires --upgradeable or --upgrade-proxy")
+
+    if args.upgrade_proxy:
+        if args.executor:
+            raise SystemExit("--upgrade-proxy and --executor are separate operations")
+        proxy = address(args.upgrade_proxy, "--upgrade-proxy")
+        plan = upgrade_plan(
+            proxy=proxy, deployer=deployer, owner=owner, morpho=morpho,
+            implementation=address(args.implementation, "--implementation") if args.implementation else "",
+            nonce=args.nonce,
+        )
+        emit(plan, args.output)
+        return 0
 
     if args.executor:
         # Allowlist-only plan. The executor and both adapters already exist on-chain, so nothing
