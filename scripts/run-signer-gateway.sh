@@ -118,10 +118,11 @@ if [[ "$CLEF_STATE" != "live" ]]; then
 Start Clef in its own terminal and leave it there -- it prompts for approval of every
 signature:
 
-  clef --configdir ~/.clef --keystore ~/.ethereum/keystore --chainid 8453
+  scripts/run-clef.sh
 
---keystore matters: without it Clef may start with no account for the deployer, which
-only surfaces as a failure at signing time.
+That wrapper pins every path Clef would otherwise take from a default or from cwd --
+including --auditlog, whose default is relative, and --keystore, without which Clef may
+start with no account for the deployer and only fail at signing time.
 EOF
     exit 2
 fi

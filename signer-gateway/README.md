@@ -58,15 +58,24 @@ Start Clef with Base's chain ID and a Unix socket. Keep its interactive console 
 so each deployment transaction can be reviewed and approved manually:
 
 ```bash
-clef \
-  --keystore /home/shiesty/.ethereum/keystore \
-  --configdir /home/shiesty/.clef \
-  --chainid 8453 \
-  --ipcpath /run/user/1000/base-arb-clef.ipc
+scripts/run-clef.sh
 ```
 
-Adjust `/run/user/1000` for the local user ID. Do not expose Clef over HTTP or enable
-automatic Clef rules for the initial deployment.
+Use the wrapper rather than invoking `clef` directly. It pins the config directory,
+keystore, chain ID, IPC path and audit log, and refuses to start a second Clef over a
+socket a running one already holds. Each is overridable through `CLEF_*` environment
+variables for a one-off, but the defaults are the ones the rest of this project expects
+-- `scripts/run-signer-gateway.sh` resolves the same IPC path independently.
+
+`--auditlog` is the one worth understanding. Its default is the *relative* path
+`audit.log`, so Clef records every signature it serves into whatever directory it was
+launched from. That is not a tidiness problem: it silently splits the signing record
+across directories, and a partial audit log that reads as a complete one is worse than
+having none. The wrapper fixes it inside the `0700` config directory, deliberately
+outside this repository -- the log names accounts and carries raw signed transactions,
+including ones that were never broadcast, and this repository is public.
+
+Do not expose Clef over HTTP or enable automatic Clef rules for the initial deployment.
 
 ## 2. Configure and run the gateway
 
