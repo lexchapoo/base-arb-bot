@@ -32,3 +32,12 @@ graphify-out/
 # Signed deployment plans: chmod 0600, operator-local, and pinned to a specific nonce.
 # They contain no secrets, but they are per-run artifacts and must not be shared or reused.
 plans/
+
+# Clef's signing audit log. Untracked deliberately, and NOT because it is noise: it records
+# every signature request Clef served, including the raw signed transaction, and some of those
+# were never broadcast -- so it can name accounts that have no on-chain footprint at all. This
+# repository is public. Tracking it also produced a misleading artifact rather than a trail:
+# Clef writes audit.log relative to its working directory, so what landed here was only the
+# signatures made while Clef happened to be started from the repository root, and the rest went
+# to ~/audit.log. A partial audit log that reads as authoritative is worse than none.
+audit.log
