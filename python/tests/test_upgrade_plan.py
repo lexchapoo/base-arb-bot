@@ -124,3 +124,36 @@ def test_postconditions_name_the_check_that_proves_the_layout_held():
     assert "paused()" in conditions
     assert "morpho()" in conditions
     assert OWNER in conditions
+
+
+def test_phase_two_refuses_a_zero_morpho():
+    """The whole point of this plan is Morpho support; setMorpho(0) would spend the nonce
+    upgrading into a proxy that refuses every Morpho route, and say so in a postcondition as
+    though it were intended. MORPHO_ADDRESS missing from .env is the way this happens."""
+    module = _load()
+    with pytest.raises(SystemExit) as excinfo:
+        module.upgrade_plan(
+            proxy=module.to_checksum_address(PROXY),
+            deployer=module.to_checksum_address(OWNER),
+            owner=module.to_checksum_address(OWNER),
+            morpho=module.ZERO_ADDRESS,
+            implementation=module.to_checksum_address(IMPL),
+            nonce=9,
+        )
+    assert "MORPHO_ADDRESS" in str(excinfo.value)
+
+
+def test_phase_one_still_works_without_a_morpho_address():
+    """Phase 1 only puts logic on chain -- it configures nothing, so it must not be blocked by
+    a check that belongs to phase 2."""
+    module = _load()
+    plan = module.upgrade_plan(
+        proxy=module.to_checksum_address(PROXY),
+        deployer=module.to_checksum_address(OWNER),
+        owner=module.to_checksum_address(OWNER),
+        morpho=module.ZERO_ADDRESS,
+        implementation="",
+        nonce=9,
+    )
+    assert plan["upgrade_phase"] == 1
+    assert plan["transactions"][0]["to"] is None

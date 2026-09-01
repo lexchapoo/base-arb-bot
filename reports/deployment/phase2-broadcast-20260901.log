@@ -1,0 +1,94 @@
+=== phase 2 broadcast 2026-09-01T11:27:27-04:00 ===
+plan: plans/upgrade-phase2-nonce19.json
+plan sha: acca81f9bdcbcef5ec575ddaee10997ed6cc32e7f60fab25b28eb2d375612a70
+deployer: 0x341938C405773Fc8aE3980c07cA5A516855ED7a2 nonce 19
+
+{
+  "broadcast": true,
+  "plan_hash": "0xacca81f9bdcbcef5ec575ddaee10997ed6cc32e7f60fab25b28eb2d375612a70",
+  "tx_hashes": [
+    "0x6d3d5eadd72f3803b28b81614081cbee5990e7b6672c672e6f107be49b3cf365"
+  ],
+  "predicted_addresses": {
+    "executor": "0x23E49388aB7a758AE6D582Fe6fa3E52b6c64CaEb",
+    "implementation": "0xb334a225ca2C763F452b3a940d743912a429018A"
+  },
+  "executor_paused": true,
+  "resume_from_nonce": null
+}
+=== exit= 2026-09-01T11:27:44-04:00 ===
+
+=== OUTCOME (verified on chain) ===
+Phase 2 landed. The signer gateway ran with SIGNER_GATEWAY_ADDRESS overridden to the proxy
+owner 0x341938C4...ED7a2; .env's EXTERNAL_SIGNER_ADDRESS (a separate account, the
+execution signer) would have been refused by policy.validate_deployment as a plan-identity mismatch.
+.env was deliberately not modified.
+
+tx                0x6d3d5eadd72f3803b28b81614081cbee5990e7b6672c672e6f107be49b3cf365
+block             50743557
+status            1 (success)
+from              0x341938C405773Fc8aE3980c07cA5A516855ED7a2 (nonce 19 -> 20)
+to                0x23E49388aB7a758AE6D582Fe6fa3E52b6c64CaEb (the live proxy)
+call              upgradeToAndCall(0xb334a225...9018A, setMorpho(0xBBBB...FFCb))
+gasUsed           69302 of 84192 limit (estimate was 70160)
+effectiveGasPrice 6000000 wei
+cost              0.000000415812 ETH  (balance 0.000968745870 -> 0.000968328146)
+plan sha256       acca81f9bdcbcef5ec575ddaee10997ed6cc32e7f60fab25b28eb2d375612a70
+
+Postconditions verified:
+  owner()      0x341938C4... (unchanged) ............... PASS  <- proves layout survived
+  POOL()       0xA238Dd80... (unchanged) ............... PASS
+  paused()     true (unchanged) ....................... PASS
+  MORPHO()     0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb PASS
+  impl slot    0xb334a225... (phase-1 implementation) .. PASS
+  scripts_verify_runtime.py FLASH_PROVIDER=morpho ...... exit 0
+
+Executor remains PAUSED. DRY_RUN=true, LIVE_TRADING=false. Deployment signing was disabled
+again by stopping the gateway; execution signing was never enabled.
+
+Open items (not blockers, not addressed here):
+  - .env EXECUTOR_ADDRESS is empty; the live proxy is 0x23E49388aB7a758AE6D582Fe6fa3E52b6c64CaEb.
+    scripts_verify_runtime.py needed it passed on the command line.
+  - .env EXECUTOR_OWNER_ADDRESS names a different account, not the on-chain owner 0x341938C4...
+    and pendingOwner() is 0x0, so no handover is in flight.
+  - scripts/run-signer-gateway.sh guards the Clef socket with `-S`, which passes on a stale
+    socket left by a crashed Clef. It was stale before this run.
+
+=== OPEN ITEMS RESOLVED 2026-09-01 (post-deployment, no chain transaction) ===
+All three were fixed after the upgrade landed. No mainnet transaction was involved.
+
+1. .env EXECUTOR_ADDRESS was empty -> set to the live proxy 0x23E49388aB7a758AE6D582Fe6fa3E52b6c64CaEb.
+   scripts_verify_runtime.py now runs from .env alone (exit 0). The value also arms the
+   execution-signing destination allowlist (policy.py:167) and unblocks the Rust dry-run
+   path, which returns PRECONDITION_FAILED without it (main.rs:1108).
+
+2. .env EXECUTOR_OWNER_ADDRESS named a different account, which is not the owner. Operator chose to
+   make the config describe chain reality rather than hand ownership over, so it is now
+   0x341938C405773Fc8aE3980c07cA5A516855ED7a2, matching owner() read at block 50743557.
+   This was a present-tense bug, not a cosmetic one: start/startPacked are onlyOwner and
+   main.rs:1119 simulates with this address as `from`, so every dry-run route reverted
+   Unauthorized() (0x82b42900) regardless of merit. Verified fixed -- the same simulated call
+   now returns Paused() (0x9e87fac8), i.e. it reaches business logic and correctly reports the
+   executor as still dark.
+   The variable was also DEFINED TWICE (the second assignment silently won), so correcting
+   only the first would have changed nothing. Collapsed to a single definition.
+
+3. scripts/run-signer-gateway.sh guarded the Clef socket with `-S`, which passes on the stale
+   socket a crashed Clef leaves behind -- it was stale before this deployment. The guard now
+   opens the socket. Four states tested: live (proceeds), stale (exit 2), missing (exit 2),
+   venv-python absent (exit 2). The stale case is the one the old guard admitted.
+
+Still open, deliberately, and NOT a config error:
+  - The contract has a single `owner` that is at once the trader (start/startPacked are
+    onlyOwner) and the upgrade authority (_authorizeUpgrade is onlyOwner); there is no separate
+    operator role. EXTERNAL_SIGNER_ADDRESS therefore does not match
+    EXECUTOR_OWNER_ADDRESS, and main.rs:933 requires equality on the live-submission path, so
+    enabling LIVE_TRADING fails closed until this is settled. Settling it means either signing
+    trades with the upgrade key, or handing the upgrade key to the trading account, or adding
+    an operator role in a further upgrade. That account remains funded and unused.
+
+Validation after these changes: python-test 261 passed (exit 0), python-static exit 0,
+rust-test incl. clippy -D warnings exit 0, solidity-test 22 passed (exit 0), check exit 0,
+signer-gateway 6 passed. BaseProxyUpgradeFork could NOT be run here (local node has pruned
+history at its pinned block 50371060, and no outbound route to the archive RPC); its five
+testLiveProxyPreconditions assertions were checked by hand against head state and all hold.

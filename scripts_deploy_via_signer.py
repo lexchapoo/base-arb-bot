@@ -338,7 +338,18 @@ def main() -> int:
             headers={"Authorization": f"Bearer {token}"},
             timeout=330,
         )
-        response.raise_for_status()
+        # Surface the gateway's own reason before httpx flattens it into a bare status line.
+        # A refusal here carries the whole diagnosis -- which policy rejected it, or what Clef
+        # said -- and losing it turns a one-line fix into a blind hunt.
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise RuntimeError(
+                f"signer gateway refused nonce {item['nonce']} "
+                f"({item.get('purpose', 'unknown')}): HTTP {response.status_code}: {detail}"
+            )
         raw_transaction = response.json().get("raw_transaction", "")
         if not raw_transaction.startswith("0x"):
             raise RuntimeError("signer gateway returned invalid raw transaction")

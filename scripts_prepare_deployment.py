@@ -130,6 +130,19 @@ def upgrade_plan(*, proxy: str, deployer: str, owner: str, morpho: str,
             ],
         }
 
+    # A zero MORPHO here is always a mistake, and a silent one. Zero is a legitimate value in
+    # a fresh deployment -- it means "this deployment does not use Morpho" -- so `address()`
+    # never sees it and MORPHO_ADDRESS being absent from .env costs nothing there. But this
+    # plan exists only to give a live proxy Morpho support, and it spends the owner nonce on
+    # `setMorpho(0)`: the upgrade lands, every Morpho route is refused, and the postcondition
+    # reads "verify executor.MORPHO() is 0x0" as though that were the intent. Reopening exactly
+    # the window the two-phase split was built to close, via an unset variable.
+    if morpho == ZERO_ADDRESS:
+        raise SystemExit(
+            "phase 2 upgrades the proxy to gain Morpho support, so MORPHO_ADDRESS must be set: "
+            "setMorpho(0) would burn the nonce and leave every Morpho route refused"
+        )
+
     # Phase 2. The payload runs as the owner via delegatecall; see the docstring.
     payload = call_data("setMorpho(address)", ["address"], [morpho])
     return {

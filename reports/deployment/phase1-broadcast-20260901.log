@@ -1,0 +1,36 @@
+=== phase 1 broadcast 2026-09-01T06:24:27-04:00 ===
+plan: plans/upgrade-phase1-nonce18.json
+deployer: 0x341938C405773Fc8aE3980c07cA5A516855ED7a2 nonce 18
+
+pending nonce changed: plan=18 chain=19; regenerate plan
+
+=== exit=0 2026-09-01T06:24:27-04:00 ===
+
+=== OUTCOME (verified on chain, not by the run above) ===
+Phase 1 landed at 2026-09-01T06:23:33-04:00, 54s before the run above started.
+The run above therefore aborted at the pending-nonce guard and signed nothing.
+Broadcaster CONFIRMED: the operator, via the signer gateway + Clef, approved
+interactively at 2026-09-01T06:23:15 (Clef transcript supplied). Signed tx hash
+matches the mined tx. Clef's 'Key does not exist' warning refers to its credential
+store having no saved password, not a missing key; it prompted and signed normally.
+
+tx              0xc976a4ddf8e0e2bb216aaa3c6eebd9fcd3e0bd4ac6534dc6c0ad1895465197f1
+block           50734433
+status          1 (success)
+from            0x341938C405773Fc8aE3980c07cA5A516855ED7a2 (nonce 18 -> 19)
+implementation  0xb334a225ca2C763F452b3a940d743912a429018A   (matches plan prediction)
+gasUsed         4438187 of 5369494 limit
+effectiveGasPrice 6000000 wei
+cost            0.000026755 ETH  (balance 0.000995501 -> 0.000968746)
+
+Postconditions verified:
+  impl owner()          0x0 .......................... PASS
+  impl initialize()     reverts InvalidInitialization() PASS
+  proxy impl slot       0x9dc8b460... (unchanged) ..... PASS
+  proxy owner()         0x341938C4... (unchanged) ..... PASS
+  proxy paused()        true (unchanged) .............. PASS
+  impl MORPHO()         returns 0x0 (selector exists) . Morpho-capable build confirmed
+
+NEXT: phase 2 not yet generated.
+  python/.venv/bin/python scripts_prepare_deployment.py --upgrade-proxy \
+    --implementation 0xb334a225ca2C763F452b3a940d743912a429018A
