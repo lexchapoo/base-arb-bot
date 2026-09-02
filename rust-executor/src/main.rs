@@ -380,14 +380,18 @@ fn registry_fetch_budget() -> Duration {
 
 async fn load_watched_pools() -> HashSet<String> {
     let mut watched = watched_pool_set();
-    let enabled = env::var("AUTO_POOL_DISCOVERY_ENABLED")
-        .unwrap_or_else(|_| "true".into())
-        .eq_ignore_ascii_case("true");
-    if !enabled {
-        return watched;
-    }
+    // The registry read is deliberately NOT gated on AUTO_POOL_DISCOVERY_ENABLED. That flag
+    // governs whether Python scans factories for new pools; it says nothing about whether the
+    // registry has pools worth watching. An operator-curated selection is served from the same
+    // endpoint and survives with discovery off, so gating on that flag silently narrowed
+    // ingestion to the manual WATCHED_POOL_ADDRESSES overrides while Python routed a much
+    // larger curated graph -- the watcher would then never deliver an event for most of the
+    // pools the router was actually trading. Opt out by setting the URL empty.
     let url = env::var("PYTHON_POOL_REGISTRY_URL")
         .unwrap_or_else(|_| "http://python-api:8080/pools/addresses".into());
+    if url.trim().is_empty() {
+        return watched;
+    }
     match registry_client().get(url).send().await {
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<Value>().await {
