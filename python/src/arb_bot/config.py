@@ -15,6 +15,18 @@ class Settings(BaseSettings):
     chain_id: int = 8453
     base_http_rpc: str = "https://mainnet.base.org"
     base_http_rpcs: str = ""
+    # How the read path orders its endpoints. "rotate" round-robins every read across the pool,
+    # which is what keeps a single metered provider from rate-limiting a bursty quote fan-out.
+    # "primary_first" sends reads to BASE_HTTP_RPC and touches the rest only on failure -- the
+    # right choice once the primary is a local node, where rotation is pure loss: a local read
+    # costs ~0.4ms against ~50ms for a remote one, so round-robin put half of every fan-out on
+    # the slow endpoint and made an evaluation pass overrun its budget (measured: 5.4s vs 0.40s
+    # for the same 14 cycles), which discards every route in the pass.
+    #
+    # Either way the other endpoints stay configured and stay used for failover, and this does
+    # not touch RPC_CONSENSUS_REQUIRED: provider agreement is enforced at the Rust submission
+    # boundary, which reads the same BASE_HTTP_RPCS list and still needs two providers in it.
+    rpc_read_strategy: str = "rotate"
     rpc_consensus_required: bool = True
     rpc_probe_timeout_seconds: float = 2.5
     receipt_poll_ms: int = 1000

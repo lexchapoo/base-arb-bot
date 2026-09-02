@@ -18,6 +18,8 @@ import aiohttp
 from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 
+from .config import settings
+
 
 def endpoint_list(primary: str, extra: str) -> list[str]:
     """Ordered, de-duplicated read endpoints.
@@ -42,10 +44,21 @@ class RotatingProviders:
     calls and retrying the next endpoint turns a hard route failure into a slower one.
     """
 
-    def __init__(self, urls: list[str], attempt_timeout_seconds: float = 1.5) -> None:
+    def __init__(
+        self,
+        urls: list[str],
+        attempt_timeout_seconds: float = 1.5,
+        strategy: str | None = None,
+    ) -> None:
         if not urls:
             raise ValueError("at least one RPC endpoint is required")
         self.urls = urls
+        # "rotate" (default) round-robins; "primary_first" pins reads to urls[0] and keeps the
+        # rest as failover. See Settings.rpc_read_strategy for why. Unknown values fall back to
+        # rotation rather than failing a deployment over a typo in an operational knob.
+        if strategy is None:
+            strategy = getattr(settings, "rpc_read_strategy", "rotate")
+        self.strategy = "primary_first" if str(strategy).strip().lower() == "primary_first" else "rotate"
         # web3 leaves AsyncHTTPProvider without a request timeout, so a stalled endpoint blocks
         # far past the caller's deadline. With failover that cost multiplies: N unbounded
         # attempts in series. Bound each attempt so the whole chain still fits inside
@@ -75,7 +88,13 @@ class RotatingProviders:
         return len(self._clients)
 
     def ordered(self) -> list[AsyncWeb3]:
-        """Every client once, starting at the next position in the rotation."""
+        """Every client once, in the order this read should try them.
+
+        Both strategies return the full list, so failover is unchanged; they differ only in
+        which endpoint is asked first.
+        """
+        if self.strategy == "primary_first":
+            return list(self._clients)
         start = next(self._counter) % len(self._clients)
         return self._clients[start:] + self._clients[:start]
 
