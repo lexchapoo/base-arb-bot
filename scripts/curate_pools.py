@@ -17,6 +17,11 @@ re-running with a tighter floor actually drops what no longer qualifies.
   ./scripts/curate_pools.py --dry-run          # rank + report, register nothing
   ./scripts/curate_pools.py --top 400          # register the best 400
   ./scripts/curate_pools.py --min-weth 2 --min-usdc 5000
+  ./scripts/curate_pools.py --skip-top 100 --top 60   # the mid-liquidity band
+
+Both sides are checked. The hub floor ranks a pool; the paired-token balance decides
+whether it can be swapped at all. Flooring the hub side alone selected pools that quote
+at amount_out ~ 0 -- see --min-other.
 """
 from __future__ import annotations
 import argparse, asyncio, json, os, sys
@@ -68,6 +73,11 @@ class Pool:
     # False until a balance was actually read. Distinguishes "this pool holds nothing"
     # from "nobody told us what this pool holds" -- both used to score 0 and be dropped.
     resolved: bool = False
+    # The paired (non-hub) token. Ranking and flooring on the hub side alone says nothing
+    # about whether a swap INTO the other side can execute -- see probe_tradeable().
+    other: str | None = None
+    # Round-trip retention measured by a real quote, or None if never probed.
+    roundtrip: Decimal | None = None
 
     @property
     def hub_amount(self) -> Decimal:
@@ -149,6 +159,108 @@ async def fetch_hub_balances(mc: MulticallClient, pools: list[Pool], batch: int)
     return [p for p in pools if not p.resolved]
 
 
+async def probe_tradeable(mc: MulticallClient, pools: list[Pool], batch: int,
+                          min_roundtrip: Decimal) -> None:
+    """Quote a small round trip through each pool and record what survives it.
+
+    Balance heuristics cannot answer "is this pool routable". A pool holding 92,000 USDC
+    against 1.13 units of an 8-decimal token is either perfectly balanced or completely
+    broken depending on a price we do not have for arbitrary long-tail tokens, and any
+    units-based floor is therefore arbitrary. So stop guessing and ask the same quoters
+    the router will ask: swap hub -> other, then the proceeds back other -> hub.
+
+    Retention is the ratio out/in over that round trip. A healthy pool returns roughly
+    1 - 2*fee (about 0.994 at 0.3%, 0.98 at 1%); a pool that cannot be traded returns
+    ~0, which is exactly the -100% every 2-leg route showed on a hub-floored mid-tier
+    selection. The test needs no price, works across venues, and is priced in the pool's
+    own depth: the probe size is a fixed fraction of the hub balance, so it is small for
+    a thin pool and small for a deep one.
+
+    Two batched rounds, because the second leg's input is the first leg's output.
+    Pools whose quotes revert or return zero are left with roundtrip=None and are
+    dropped by the caller -- an unquotable pool is not a tradeable one.
+    """
+    from arb_bot.route_engine import AdapterRegistry
+    registry = AdapterRegistry()
+
+    def kwargs_for(p: Pool) -> dict:
+        venue = canonical_venue(p.venue)
+        if venue == "uniswap-v3":
+            return {"fee": p.fee, "block_identifier": "latest"}
+        if venue == "aerodrome-slipstream":
+            return {"tick_spacing": p.tick_spacing, "block_identifier": "latest"}
+        if venue == "aerodrome":
+            return {"stable": p.stable, "block_identifier": "latest"}
+        return {"block_identifier": "latest"}
+
+    # 1 basis point of the pool's hub balance: large enough to clear rounding, small
+    # enough that a healthy pool's slippage stays far below the fee term.
+    probes = []
+    for p in pools:
+        adapter = registry.get(p.venue)
+        amount_in = p.hub_raw // 10_000
+        if adapter is None or amount_in <= 0:
+            continue
+        if not hasattr(adapter, "encode_quote") or not hasattr(adapter, "decode_quote"):
+            continue
+        probes.append((p, adapter, amount_in, kwargs_for(p)))
+
+    total = len(probes)
+    print(f"  probing {total:,} pools with a round-trip quote")
+    for s_ in range(0, total, batch):
+        chunk = probes[s_:s_ + batch]
+
+        # leg 1: hub -> other
+        calls, live = [], []
+        for p, ad, amt, kw in chunk:
+            try:
+                calls.append(ad.encode_quote(p.hub, p.other, amt, **kw))
+                live.append((p, ad, amt, kw))
+            except Exception:
+                continue
+        if not calls:
+            continue
+        try:
+            rets = await mc.aggregate3(calls, block_identifier="latest")
+        except Exception as e:
+            print(f"  probe batch {s_} leg1 failed: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+
+        # leg 2: other -> hub, sized by what leg 1 actually returned
+        calls2, live2 = [], []
+        for (p, ad, amt, kw), (ok, data) in zip(live, rets):
+            if not ok or not data:
+                continue
+            try:
+                out1 = ad.decode_quote(data, p.hub, p.other, amt, **kw).amount_out
+            except Exception:
+                continue
+            if out1 <= 0:
+                continue
+            try:
+                calls2.append(ad.encode_quote(p.other, p.hub, out1, **kw))
+                live2.append((p, ad, amt, kw))
+            except Exception:
+                continue
+        if not calls2:
+            continue
+        try:
+            rets2 = await mc.aggregate3(calls2, block_identifier="latest")
+        except Exception as e:
+            print(f"  probe batch {s_} leg2 failed: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        for (p, ad, amt, kw), (ok, data) in zip(live2, rets2):
+            if not ok or not data:
+                continue
+            try:
+                out2 = ad.decode_quote(data, p.other, p.hub, amt, **kw).amount_out
+            except Exception:
+                continue
+            p.roundtrip = Decimal(out2) / Decimal(amt) if amt else None
+        print(f"  probed {min(s_+batch,total)}/{total}", end="\r", flush=True)
+    print()
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rpc", default=os.environ.get("CURATE_RPC", "http://127.0.0.1:8545"))
@@ -157,11 +269,19 @@ async def main() -> int:
     ap.add_argument("--api-token", default=os.environ.get("OPERATOR_API_TOKEN", ""),
                     help="operator token for /pools/select (default $OPERATOR_API_TOKEN)")
     ap.add_argument("--top", type=int, default=400)
+    ap.add_argument("--skip-top", type=int, default=0,
+                    help="drop the N deepest pools before taking --top, selecting a "
+                         "mid-liquidity band; the deepest pools are the most efficiently "
+                         "priced and carry the least arbitrage")
     ap.add_argument("--batch", type=int, default=300)
     ap.add_argument("--dry-run", action="store_true")
     # _decimal, not Decimal: argparse turns ValueError/TypeError from a converter into a
     # clean "error: argument --min-weth: ..." message, but Decimal("abc") raises
     # InvalidOperation, which derives from ArithmeticError and escapes as a raw traceback.
+    ap.add_argument("--min-roundtrip", type=_decimal, default=Decimal("0.9"),
+                    help="minimum out/in retention on a round-trip quote for a pool "
+                         "to count as tradeable; a healthy pool returns about "
+                         "1 - 2*fee, an untradeable one returns ~0")
     ap.add_argument("--min-weth", type=_decimal, default=None)
     ap.add_argument("--min-usdc", type=_decimal, default=None)
     ap.add_argument("--weth-usd", type=_decimal, default=None,
@@ -211,8 +331,8 @@ async def main() -> int:
         # without it, so dropping it here selected pools that could never be routed.
         p = Pool(r["address"], r["token0"].lower(), r["token1"].lower(),
                  r["venue"], r["pool_type"], r["fee"], r["stable"], r["tick_spacing"])
-        if p.token0 in HUBS:   p.hub = p.token0
-        elif p.token1 in HUBS: p.hub = p.token1
+        if p.token0 in HUBS:   p.hub, p.other = p.token0, p.token1
+        elif p.token1 in HUBS: p.hub, p.other = p.token1, p.token0
         else: continue
         pools.append(p)
     print(f"  {len(pools):,} pair a hub token ({len(rows)-len(pools):,} skipped: no hub side)")
@@ -244,6 +364,25 @@ async def main() -> int:
     kept = [p for p in pools if p.hub_amount >= floors[p.hub][2]]
     kept.sort(key=lambda p: (-hub_usd(p), p.address))
 
+    # A pool is only routable if it can actually be swapped, which a balance cannot tell
+    # us: the counter-side is priced in a token we have no reference for. Ask the router's
+    # own quoters instead and keep what survives a round trip. See probe_tradeable().
+    if kept:
+        print(f"\nprobing tradeability of the {len(kept):,} pools that cleared the hub floor")
+        await probe_tradeable(mc, kept, a.batch, a.min_roundtrip)
+        before = len(kept)
+        unquotable = [p for p in kept if p.roundtrip is None]
+        lossy = [p for p in kept if p.roundtrip is not None and p.roundtrip < a.min_roundtrip]
+        drop = {id(p) for p in unquotable} | {id(p) for p in lossy}
+        kept = [p for p in kept if id(p) not in drop]
+        print(f"  dropped {before - len(kept):,} of {before:,}: "
+              f"{len(unquotable):,} unquotable, "
+              f"{len(lossy):,} below {a.min_roundtrip:g} round-trip retention")
+        if not kept:
+            print("no pool survived the tradeability probe; lower --min-roundtrip or "
+                  "widen the hub floors", file=sys.stderr)
+            return 1
+
     print(f"\n{len(kept):,} pools clear the liquidity floor:")
     by_hub: dict[str, int] = {}
     for p in kept: by_hub[floors[p.hub][0]] = by_hub.get(floors[p.hub][0], 0)+1
@@ -251,7 +390,20 @@ async def main() -> int:
         flr, usd = next((f, u) for (s_, d, f, u) in floors.values() if s_ == sym)
         print(f"    {sym:6} {n:5,}  (floor {flr:g}, ref ${usd:,.2f})")
 
-    selected = kept[:a.top]
+    # --skip-top drops the deepest N before taking --top, selecting a mid-liquidity band
+    # instead of the head of the distribution.
+    #
+    # Ranking by depth and taking the top N optimises for exactly the pools where no edge
+    # survives: the deepest WETH/USDC venues are the most contested on Base, and a measured
+    # hour over the top 40 produced 30,132 evaluations and zero positive gross profit. The
+    # searchers actually extracting value on this chain work long-tail pairs (ESHARE, BNKR,
+    # KTA, gDEX) where inefficiency persists because fewer bots quote them. Depth is a proxy
+    # for executability, not for opportunity -- the floors already handle executability.
+    selected = kept[a.skip_top:a.skip_top + a.top]
+    if a.skip_top:
+        skipped_usd = hub_usd(kept[a.skip_top - 1]) if a.skip_top <= len(kept) else 0
+        print(f"\n--skip-top {a.skip_top}: excluding the deepest {a.skip_top} pools "
+              f"(down to ${skipped_usd:,.0f} hub-side)")
 
     # Venue mix matters more than raw count: 2-hop cycles need the same pair on two
     # different venues, so a selection that is all one venue cannot arbitrage at all.
@@ -273,7 +425,7 @@ async def main() -> int:
         print(f"    {len(cycles):,} cross-venue {a.validate_hops}-hop cycle(s); first: "
               + " -> ".join(cycles[0]))
 
-    print(f"\ntop {len(selected)} by hub-side USD depth:")
+    print(f"\nselected {len(selected)} by hub-side USD depth (rank {a.skip_top+1}-{a.skip_top+len(selected)}):")
     for p in selected[:10]:
         print(f"    {p.address}  {floors[p.hub][0]:6} {p.hub_amount:,.2f}"
               f"  (${hub_usd(p):,.0f})")
