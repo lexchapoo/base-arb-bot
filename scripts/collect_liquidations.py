@@ -110,6 +110,11 @@ async def main() -> int:
     ap.add_argument("--chunk", type=int, default=10_000)
     ap.add_argument("--batch", type=int, default=200, help="borrowers per multicall")
     ap.add_argument("--no-pipeline", action="store_true", help="skip the health-factor pass")
+    ap.add_argument("--state", default="reports/liquidations/borrowers.json",
+                    help="accumulated borrower set + scan cursor, so the pipeline is not "
+                         "re-discovered from scratch on every run")
+    ap.add_argument("--seed-blocks", type=int, default=500_000,
+                    help="depth of the initial borrower scan when no state file exists")
     ap.add_argument("--out", default="reports/liquidations")
     a = ap.parse_args()
 
@@ -201,11 +206,44 @@ async def main() -> int:
     # ---- 2. borrower pipeline -----------------------------------------------------
     rows = []
     if not a.no_pipeline:
-        print("\n[2] borrowers discovered from Borrow events")
-        borrows = await scan_logs(w3, BORROW_SIG, start, latest, a.chunk)
-        users = sorted({_addr_from_topic(l["topics"][2]) for l in borrows
-                        if len(l.get("topics", [])) >= 3})
-        print(f"  {len(borrows):,} borrow events -> {len(users):,} distinct borrowers")
+        print("\n[2] borrower pipeline")
+        # Borrowers accumulate across runs. Discovering them from Borrow events inside the
+        # scan window only finds addresses that happened to transact in that window, which
+        # made the population -- and therefore the debt totals -- a function of --blocks
+        # rather than of the market: a 1.1h window reported 26 borrowers holding $1.2M and
+        # a 6h window 140 holding $46.2M, an artefact that made runs incomparable.
+        # Seed once, then advance a cursor and only scan what is new.
+        known: set[str] = set()
+        cursor = None
+        try:
+            with open(a.state) as fh:
+                st = json.load(fh)
+            known = {u.lower() for u in st.get("borrowers", [])}
+            cursor = st.get("last_scanned_block")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+
+        if cursor is None:
+            scan_from = max(0, latest - a.seed_blocks)
+            print(f"  no state at {a.state}: seeding from {scan_from:,} "
+                  f"(~{a.seed_blocks*2/86400:.1f} days)")
+        else:
+            # Re-scan a small overlap so a reorg near the cursor cannot drop a borrower.
+            scan_from = max(0, cursor - 1_000)
+            print(f"  resuming from {scan_from:,} ({len(known):,} borrowers already known)")
+
+        borrows = await scan_logs(w3, BORROW_SIG, scan_from, latest, a.chunk)
+        found = {_addr_from_topic(l["topics"][2]).lower() for l in borrows
+                 if len(l.get("topics", [])) >= 3}
+        new_users = found - known
+        known |= found
+        users = sorted(known)
+        print(f"  {len(borrows):,} borrow events in range -> {len(new_users):,} new, "
+              f"{len(users):,} tracked in total")
+
+        os.makedirs(os.path.dirname(a.state) or ".", exist_ok=True)
+        with open(a.state, "w") as fh:
+            json.dump({"last_scanned_block": latest, "borrowers": users}, fh)
 
         print("  reading health factors")
         for s in range(0, len(users), a.batch):
