@@ -1,5 +1,21 @@
 # Base Arbitrage Bot v0.5
 
+## v0.8 execution upgrades
+
+- Flashblock-triggered selective evaluation remains scoped to registered affected pools. The Rust service supports Base `pendingLogs` by default and an optional `newFlashblockTransactions` full-data stream (`FLASHBLOCK_TX_STREAM_ENABLED=true`) to extract watched pool logs directly from preconfirmed source transactions. Unknown/unwatched pools do not trigger a global rescan.
+- Packed batches now pass an integer-only adaptive submission gate after exact pending-state simulation. The gate discounts deterministic net profit by opportunity survival probability and inclusion probability, subtracts expected failure cost, and requires the result to exceed a configured safety margin.
+- Rust recomputes the adaptive gate at the final submission boundary before its own exact pending-state simulation, preventing stale/manual requests from bypassing the Python policy check.
+
+Adaptive formula:
+
+```text
+survival_bps = max(0, (survival_window_ms - total_latency_ms) * 10000 / survival_window_ms)
+expected_capture = deterministic_net_profit * survival_bps/10000 * inclusion_bps/10000 - failure_cost
+submit only when expected_capture > safety_margin
+```
+
+Keep the survival window, inclusion probability, failure cost, and safety margin calibrated from real shadow/live observations; do not treat the defaults as validated market constants.
+
 Simulation-first Base atomic-arbitrage/searcher architecture.
 
 ## Implemented pipeline
@@ -102,11 +118,10 @@ LIVE_TRADING=true
 LIVE_TRADING_ACK=I_UNDERSTAND_MAINNET_RISK
 EXTERNAL_SIGNER_URL=...
 EXTERNAL_SIGNER_ADDRESS=...
-EXTERNAL_SIGNER_BEARER_TOKEN_FILE=/secure/path/gateway-token
 EXECUTOR_OWNER_ADDRESS=...
 ```
 
-The Rust service prepares current EIP-1559 fee fields and delegates signing to the isolated signer documented in `docs/EXTERNAL_SIGNER.md`, then broadcasts only the returned signed transaction. The included local Clef gateway is documented in `signer-gateway/README.md`.
+The Rust service prepares current EIP-1559 fee fields and delegates signing to the isolated signer documented in `docs/EXTERNAL_SIGNER.md`, then broadcasts only the returned signed transaction.
 
 ## Configuration
 
@@ -135,33 +150,8 @@ Health endpoints:
 
 ```bash
 curl http://localhost:8080/health
-curl http://localhost:8085/health
+curl http://localhost:8081/health
 ```
-
-## Base Flashblocks shadow mode
-
-The authenticated Base HTTP provider can be reused as its matching WebSocket endpoint without duplicating the credential:
-
-```env
-BASE_FLASHBLOCKS_WS=from-base-http-rpc
-```
-
-Rust changes only the URL scheme from `https` to `wss`. The configured `pendingLogs` subscription is restricted to the chain-verified WETH/USDC Uniswap V3 and Aerodrome pools in `WATCHED_POOL_ADDRESSES`, and to the two exact Swap signatures in `WATCHED_TOPIC0S`. `WATCHED_POOLS_JSON` must describe exactly the same address set or Python startup fails.
-
-The production shadow gate is one hour by default:
-
-```env
-SHADOW_OBSERVATION_SECONDS=3600
-SHADOW_POLL_INTERVAL_SECONDS=5
-```
-
-With the dry-run services and PostgreSQL running, execute:
-
-```bash
-make shadow-observe
-```
-
-Reports are written beneath `reports/shadow/` and record pending events, route candidates, rejection reasons, deterministic net-profit values, exact-simulation results, evaluation latency, provider-disagreement measurements, would-submit decisions, and any non-dry submission. Runs shorter than the configured duration are rejected unless explicitly invoked with `--smoke`; smoke reports never satisfy the duration gate.
 
 ## Tests
 
@@ -179,25 +169,6 @@ forge test -vvv
 ```
 
 The Solidity suite includes repayment/net-profit and route-hash mutation tests using isolated test fixtures. Real protocol validation must additionally be run against a Base mainnet fork with verified current deployment addresses.
-
-Pinned Base fork integration tests use real Aave, Aerodrome, Uniswap, WETH, and USDC contracts at block `50,048,341` (hash `0x113715da2993561eca7da017a159cc3ca24fc83f0a1e66632ac6447ed5ea7814`):
-
-```bash
-make fork-test
-```
-
-Prepare an unsigned deployment plan after compiling and configuring a funded external signer address:
-
-```bash
-set -a
-source .env
-set +a
-python scripts_prepare_deployment.py \
-  --nonce <pending-signer-nonce> \
-  --output /secure/path/deployment-plan.json
-```
-
-The planner never signs or broadcasts. The executor deploys paused, commitments cannot be replayed, and ownership transfer requires acceptance by the pending owner. Review and submit the plan through the Clef workflow in `signer-gateway/README.md`; live trading remains disabled during deployment.
 
 ## Current validation status
 
@@ -247,40 +218,74 @@ make check
 
 Codex should read `AGENTS.md` before editing. `make check` runs Python checks and runs Rust/Foundry checks when those toolchains are installed; missing toolchains are reported as `NOT RUN` rather than treated as successful. Keep `DRY_RUN=true` while validating the deployment.
 
-## Latency & reliability (route evaluation)
+## v0.9 automatic pool discovery
 
-An arbitrage opportunity on Base lives roughly one to two blocks (~2–4s), so
-route evaluation is tuned to fit inside that window.
+Manual `WATCHED_POOL_ADDRESSES` population is no longer required. On startup, the Python service discovers and verifies Base pools from the configured Aerodrome and Uniswap V3 factories and exposes the resulting registry at `GET /pools/addresses`. The Rust Flashblocks watcher merges this live registry with any manual overrides and automatically rebuilds its filtered subscriptions when the registry changes.
 
-Quoting:
+Useful controls:
 
-- Pool quotes are batched through Multicall3 (`arb_bot.multicall`): one
-  `aggregate3` request per hop across every candidate size, instead of one RPC
-  round-trip per candidate.
-- First-hop balances are prefetched in a single multicall rather than one
-  `balanceOf` per cycle.
-- Rotational-duplicate cycles (the same directed ring enumerated from different
-  entry points) are collapsed before evaluation; the reverse direction is kept.
-- Candidate sizes and cycles are quoted concurrently behind a bounded semaphore
-  (`QUOTE_CONCURRENCY`).
+```env
+AUTO_POOL_DISCOVERY_ENABLED=true
+POOL_DISCOVERY_REFRESH_SECONDS=60
+POOL_DISCOVERY_FROM_BLOCK=0
+POOL_DISCOVERY_LOG_CHUNK_BLOCKS=20000
+POOL_DISCOVERY_TOKEN_ALLOWLIST=
+PYTHON_POOL_REGISTRY_URL=http://python-api:8080/pools/addresses
+WATCH_POOL_REFRESH_SECONDS=30
+WATCH_POOL_SUBSCRIPTION_CHUNK_SIZE=200
+```
 
-Together these bring a single `/route-trigger` evaluation from tens of seconds
-down to a couple of seconds against a standard Base RPC. Note the quoter itself
-(`quoteExactInputSingle`) is ~1s of on-chain compute per call, so competitive
-production searching still benefits from local node state rather than remote
-quote simulation.
+`POST /pools/refresh` forces a discovery refresh. `GET /pools` shows full metadata; `GET /pools/addresses` returns the exact address set consumed by Rust.
 
-Executor ingestion (Rust):
+The three mutating curation endpoints — `POST /pools/select`, `POST /pools/register`, and `DELETE /pools/{address}` — require an operator token: `Authorization: Bearer $OPERATOR_API_TOKEN`. They rewrite the durable curated set and the live routing graph, so an unauthenticated caller that can reach the port could point route evaluation at pools of its choosing, or empty the graph and halt trading — and because the selection is durable, a restart would not undo it. **They are refused outright (503) while `OPERATOR_API_TOKEN` is unset**, so an existing deployment must set one before curating; generate with `openssl rand -hex 32`. Read-only endpoints (`GET /pools`, `GET /pools/addresses`) are unchanged, as is `POST /pools/refresh`. `scripts/curate_pools.py` reads `$OPERATOR_API_TOKEN` or takes `--api-token`.
 
-- One pooled HTTP client with bounded request/connect timeouts is reused for
-  `/route-trigger` POSTs, so a stalled POST cannot permanently leak a
-  concurrency permit (`MAX_INFLIGHT_ROUTE_TRIGGERS`,
-  `ROUTE_TRIGGER_TIMEOUT_SECONDS`).
-- The `pendingLogs` WebSocket has an idle-timeout heartbeat: if no message
-  arrives within `WS_IDLE_TIMEOUT_SECONDS` the subscription is treated as
-  silently stalled and reconnected, instead of blocking forever on a
-  connected-but-dead socket.
+Curation is a **filter over discovery**, not an accumulation. `POST /pools/select` takes the full list of pools the router should run on: it persists them to `curated_pools`, replaces the graph, and installs the selection as a standing restriction. Discovery keeps running and keeps persisting everything it verifies to `verified_pools`, but only curated pools enter the routable graph — so a selection is not undone by the next refresh, and it survives a restart regardless of `AUTO_POOL_DISCOVERY_ENABLED`. An empty `POST /pools/select` lifts the restriction and hands the graph back to discovery — rebuilding it from `verified_pools`, not merely unfiltering: pools discovery registered while a selection was in force were dropped at the door and its cursors have advanced past them, so unfiltering alone would leave the graph holding only the ex-selection until a restart. If that registry cannot be read the request is refused with 503 and the current selection is left intact.
 
-Tuning knobs (see `.env.example`): `MAX_QUOTE_EVALUATIONS`, `QUOTE_CONCURRENCY`,
-`ROUTE_TRIGGER_TIMEOUT_SECONDS`, `WS_IDLE_TIMEOUT_SECONDS`,
-`MAX_INFLIGHT_ROUTE_TRIGGERS`.
+`POST /pools/register` and `DELETE /pools/{address}` amend a selection that is already in force (widening or narrowing the restriction, and writing through to `curated_pools`). With no selection in force the graph belongs to discovery, so those two are graph-only and say so in the response (`curated: false` / `permanent: false`) — a single registration is deliberately not persisted, because that would make the curated table non-empty and the next restart would read it as "the selection is this one pool".
+
+If the curated set cannot be read, the graph is held **empty** rather than left unrestricted, and `/ready` returns 503 naming which phase failed (schema vs. selection) — a database blip must not be the reason the router starts trading the full discovery output, nor the reason a healthy-looking process routes nothing without saying so. Schema migration and curated restore are retried independently on every readiness check until both land.
+
+All writes that span durable storage and the live graph are serialised by one lock, so the two can never describe different pool sets. That covers `select`, `register`, `delete`, the startup restore, **and discovery's own persist-and-register step** — persisting a pool, registering it, and advancing the cursor past it is a single step, and splitting it across a restriction being lifted loses the pool: it lands in `verified_pools`, is filtered out of the graph by the outgoing restriction, misses the rebuild's earlier snapshot, and is never rescanned. Discovery's `restore()` stays outside the lock; it advances no cursor, so a rebuild from the same table always recovers it.
+
+Registrations must carry the field the quoter routes on (`fee` for Uniswap V3, `stable` for Aerodrome, `tick_spacing` for Slipstream) or they are rejected with 422 rather than becoming unroutable graph entries.
+
+## v0.10 persistent pool discovery
+
+Verified pool metadata and factory discovery cursors are persisted in PostgreSQL. On restart, the Python API restores the verified registry into the live graph before scanning forward. Uniswap V3 resumes from the last atomically committed block cursor, and Aerodrome resumes from the last committed `allPools` index. Existing deployments are upgraded automatically by SQLAlchemy `create_all`; fresh PostgreSQL volumes also receive the tables through `sql/init.sql`.
+
+
+## v0.11 state/telemetry layer
+
+- Rust keeps an event-backed local state fingerprint/cache for every watched pool.
+- Every route trigger carries a state version and monotonic sequence.
+- Submission fails closed if market state advances before final simulation/signing.
+- `BASE_HTTP_RPCS` supports multiple independent Base HTTPS providers; critical simulation requires agreement when `RPC_CONSENSUS_REQUIRED=true`. Agreement is checked on two axes: identical bytes at the highest commonly sealed block (always), and the `pending` state the trade was priced against (`RPC_CONSENSUS_PENDING_MODE`: `off`, `observe` (default, warns on divergence), `strict` (rejects)). `pending` is provider-local by construction, so `strict` is correct only where both endpoints share a mempool view. The submission response reports which axis actually held.
+- Every evaluated trigger is persisted to `opportunity_telemetry` for replay and missed-opportunity analysis.
+- Live receipts store exact gas used, effective gas price, Base `l1Fee` when present, and settlement-token balance deltas.
+- Cross-asset gas conversion is never invented; exact net asset PnL is marked only when conversion is mathematically exact.
+
+Useful APIs:
+
+```bash
+curl http://localhost:8080/telemetry/opportunities
+curl http://localhost:8080/telemetry/replay/<opportunity_id>
+curl http://localhost:8081/health
+```
+
+## v0.12 — telemetry-driven shadow intelligence
+
+The strategy API now computes empirical, observation-backed intelligence without placing ML in the transaction-control path:
+
+- route-family capture probability from completed receipt outcomes;
+- pool-state survival probability from observed inter-event lifetimes;
+- Flashblock sender/multi-pool fingerprints for competitor analysis; and
+- a shadow `NOW / WAIT / SKIP` recommendation persisted beside the real deterministic decision.
+
+No probability is emitted until `SHADOW_MIN_SAMPLES` real observations exist. The shadow recommendation never changes packed calldata, route ordering, signing, or submission.
+
+Useful endpoints:
+
+```bash
+curl http://localhost:8080/intelligence/shadow
+curl http://localhost:8080/intelligence/competitors
+```

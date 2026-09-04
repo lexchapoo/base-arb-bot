@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {BaseArbExecutor} from "../src/BaseArbExecutor.sol";
 import {AerodromeAdapter} from "../src/adapters/AerodromeAdapter.sol";
 import {UniswapV3Adapter} from "../src/adapters/UniswapV3Adapter.sol";
-import {IERC20, IAavePool, IFlashLoanSimpleReceiver} from "../src/interfaces.sol";
+import {IERC20, IAavePool, IFlashLoanSimpleReceiver, IMorpho, IMorphoFlashLoanCallback} from "../src/interfaces.sol";
 
 interface Vm {
     function createSelectFork(string calldata rpcUrl, uint256 blockNumber) external returns (uint256 forkId);
@@ -38,6 +38,30 @@ contract AaveForkReceiver is IFlashLoanSimpleReceiver {
     }
 }
 
+/// Deliberately mirrors AaveForkReceiver so the two are comparable line for line: the only
+/// substantive differences are that nothing is transferred in to cover a premium, and the
+/// callback takes no initiator (Morpho calls back on whoever called flashLoan, so there is
+/// no third party who could aim it here).
+contract MorphoForkReceiver is IMorphoFlashLoanCallback {
+    IMorpho internal immutable morpho;
+    address internal immutable token;
+
+    constructor(address morphoAddress, address tokenAddress) {
+        morpho = IMorpho(morphoAddress);
+        token = tokenAddress;
+    }
+
+    function borrow(uint256 amount) external {
+        morpho.flashLoan(token, amount, "");
+    }
+
+    function onMorphoFlashLoan(uint256 assets, bytes calldata) external {
+        require(msg.sender == address(morpho), "unexpected morpho");
+        // Exactly `assets` -- no premium term, which is the entire point.
+        IERC20(token).approve(address(morpho), assets);
+    }
+}
+
 contract BaseMainnetForkTest {
     Vm private constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -45,6 +69,8 @@ contract BaseMainnetForkTest {
     bytes32 private constant PINNED_BLOCK_HASH = 0x113715da2993561eca7da017a159cc3ca24fc83f0a1e66632ac6447ed5ea7814;
 
     address private constant AAVE_POOL = 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5;
+    address private constant AAVE_AWETH = 0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7;
+    address private constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
     address private constant WETH = 0x4200000000000000000000000000000000000006;
     address private constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address private constant AERODROME_ROUTER = 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43;
@@ -74,6 +100,30 @@ contract BaseMainnetForkTest {
         receiver.borrow(WETH, amount);
 
         require(IERC20(WETH).balanceOf(address(receiver)) == 0, "flash repayment residue");
+    }
+
+    /// The same borrow against the real Morpho Blue singleton, funded with nothing.
+    ///
+    /// This is the claim the whole second provider rests on, checked against the deployed
+    /// contract rather than a mock: a receiver holding zero WETH can borrow and repay, because
+    /// there is no premium to find. The Aave twin above has to be pre-funded with the premium
+    /// or it reverts -- see testRealAaveFlashLoanFailsWithoutPremium.
+    function testRealMorphoFlashLoanCostsNothing() public {
+        MorphoForkReceiver receiver = new MorphoForkReceiver(MORPHO, WETH);
+
+        require(IERC20(WETH).balanceOf(address(receiver)) == 0, "receiver should start empty");
+        receiver.borrow(SWAP_INPUT);
+        require(IERC20(WETH).balanceOf(address(receiver)) == 0, "flash repayment residue");
+    }
+
+    /// Sizing depends on this: Morpho lends what the singleton holds, and on Base that is far
+    /// more WETH than the Aave reserve. Asserted as a floor rather than a figure so the test
+    /// does not fail every time liquidity moves.
+    function testMorphoHoldsMoreFlashableWethThanAave() public view {
+        uint256 morphoWeth = IERC20(WETH).balanceOf(MORPHO);
+        uint256 aaveWeth = IERC20(WETH).balanceOf(AAVE_AWETH);
+        require(morphoWeth > aaveWeth, "morpho no longer the deeper venue");
+        require(morphoWeth > 1_000 ether, "morpho weth unexpectedly shallow");
     }
 
     function testRealAaveFlashLoanFailsWithoutPremium() public {
@@ -116,7 +166,7 @@ contract BaseMainnetForkTest {
     }
 
     function testExecutorRejectsUnprofitableRealProtocolCycle() public {
-        BaseArbExecutor exec = new BaseArbExecutor(AAVE_POOL);
+        BaseArbExecutor exec = new BaseArbExecutor(AAVE_POOL, address(0));
         AerodromeAdapter aero = new AerodromeAdapter(address(exec), AERODROME_ROUTER, AERODROME_FACTORY);
         UniswapV3Adapter uni = new UniswapV3Adapter(address(exec), UNISWAP_SWAP_ROUTER_02, true);
 
@@ -133,7 +183,7 @@ contract BaseMainnetForkTest {
             BaseArbExecutor.Route(bytes32(0), WETH, SWAP_INPUT, 0, uint64(block.number), type(uint64).max, legs);
         route.routeHash = hashRoute(route);
 
-        (bool ok,) = address(exec).call(abi.encodeCall(exec.start, (route)));
+        (bool ok,) = address(exec).call(abi.encodeCall(exec.start, (route, BaseArbExecutor.FlashProvider.Aave)));
         require(!ok, "unprofitable real cycle accepted");
         require(!exec.commitmentUsed(route.routeHash), "reverted commitment remained consumed");
     }

@@ -69,3 +69,41 @@ async def test_low_profit_fallback_is_trimmed(monkeypatch):
     assert plan.submission_eligible is True
     assert plan.candidate_route_ids == ("r1",)
     assert any(x.startswith("trimmed_low_ev_candidate:r2") for x in plan.blockers)
+
+@pytest.mark.asyncio
+async def test_packed_batch_adaptive_gate_rejects_stale_trigger(monkeypatch):
+    monkeypatch.setattr(settings,"executor_address",EXEC)
+    monkeypatch.setattr(settings,"executor_owner_address",OWNER)
+    monkeypatch.setattr(settings,"adaptive_submission_enabled",True)
+    monkeypatch.setattr(settings,"opportunity_survival_window_ms",500)
+    monkeypatch.setattr(settings,"expected_execution_latency_ms",100)
+    monkeypatch.setattr(settings,"inclusion_probability_bps",10000)
+    monkeypatch.setattr(settings,"expected_failure_cost_asset_units",0)
+    monkeypatch.setattr(settings,"submission_safety_margin_asset_units",0)
+    plan=await PackedBatchFinalizer(Finalizer()).finalize(
+        [row("r1",1000,500,700)], observed_at_unix_ms=1000, now_unix_ms=2000
+    )
+    assert plan.simulation_success is True
+    assert plan.submission_eligible is False
+    assert plan.adaptive_submission["survival_probability_bps"] == 0
+    assert "adaptive_expected_capture_below_threshold" in plan.blockers
+
+
+@pytest.mark.asyncio
+async def test_trim_drops_the_binding_min_profit_not_the_tail(monkeypatch):
+    """The menu floor is min(min_profit); trimming must remove that candidate.
+
+    r_low ranks first on its own post-gas EV (its route-level gas was small) but carries the
+    lowest on-chain profit floor. Trimming the tail would drop r_high and then r_low, reporting
+    no profitable batch -- even though the r_high-only menu clears the exact packed gas cost.
+    """
+    monkeypatch.setattr(settings, "executor_address", EXEC)
+    monkeypatch.setattr(settings, "executor_owner_address", OWNER)
+    monkeypatch.setattr(settings, "adaptive_submission_enabled", False)
+    plan = await PackedBatchFinalizer(Finalizer()).finalize(
+        [row("r_low", 1000, 800, 200), row("r_high", 1000, 400, 900)]
+    )
+    assert plan.submission_eligible is True
+    assert plan.candidate_route_ids == ("r_high",)
+    assert plan.deterministic_net_profit_units == 650  # 900 - 250 exact packed gas
+    assert any(x.startswith("trimmed_low_ev_candidate:r_low") for x in plan.blockers)

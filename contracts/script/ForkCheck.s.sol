@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-interface IAavePoolProbe {
-    function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
-}
+interface IAavePoolProbe { function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128); }
 
 contract ForkCheck {
     function run(address pool) external view returns (uint128) {

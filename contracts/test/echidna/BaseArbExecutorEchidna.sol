@@ -23,7 +23,7 @@ contract BaseArbExecutorEchidna {
 
     constructor() {
         pool = new MockPool(9); // 9 bps flash premium
-        executor = new BaseArbExecutor(address(pool)); // owner == this contract
+        executor = new BaseArbExecutor(address(pool), address(0)); // owner == this contract
         token = new MockERC20();
         token.mint(address(executor), 1_000_000 ether); // executor holds funds
         initialExecutorBalance = token.balanceOf(address(executor));

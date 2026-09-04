@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Iterable
 
 from .config import settings
+from .adaptive_submission import evaluate_adaptive_submission
 from .execution import ExecutionFinalizer, conservative_eip1559_signed_size
 from .packed_batch import PackedBatch, PackedCandidate, PackedLeg, candidate_id, encode_packed_batch
 
@@ -22,6 +23,7 @@ class PackedBatchPlan:
     gas_cost_asset_units: int | None
     deterministic_net_profit_units: int | None
     submission_eligible: bool
+    adaptive_submission: dict[str, Any] | None
     blockers: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,10 +73,10 @@ class PackedBatchFinalizer:
     def __init__(self, execution_finalizer: ExecutionFinalizer) -> None:
         self.execution_finalizer = execution_finalizer
 
-    async def finalize(self, evaluations: Iterable[Any]) -> PackedBatchPlan:
+    async def finalize(self, evaluations: Iterable[Any], observed_at_unix_ms: int | None = None, now_unix_ms: int | None = None) -> PackedBatchPlan:
         groups = compatible_groups(evaluations)
         if not groups:
-            return PackedBatchPlan(None, None, None, None, None, (), False, None, None, None, None, False, ("no_compatible_packed_candidates",))
+            return PackedBatchPlan(None, None, None, None, None, (), False, None, None, None, None, False, None, ("no_compatible_packed_candidates",))
 
         rows = groups[0][: max(1, min(settings.packed_max_candidates, 8))]
         runtime = self.execution_finalizer._runtime()
@@ -104,16 +106,16 @@ class PackedBatchFinalizer:
             try:
                 sim = await rpc.simulate(tx)
             except Exception as exc:
-                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), False, None, None, None, None, False, (f"packed_simulation_rpc_failed:{type(exc).__name__}",))
+                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), False, None, None, None, None, False, None, (f"packed_simulation_rpc_failed:{type(exc).__name__}",))
             if not sim.success:
-                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), False, sim.gas_used, None, None, None, False, (f"packed_executor_simulation_failed:{sim.error or 'unknown'}",))
+                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), False, sim.gas_used, None, None, None, False, None, (f"packed_executor_simulation_failed:{sim.error or 'unknown'}",))
             try:
                 estimate = await rpc.estimate_gas(tx)
             except Exception:
                 estimate = None
             gas_values = [v for v in (sim.gas_used, estimate) if v is not None]
             if not gas_values:
-                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), True, None, None, None, None, False, ("packed_gas_measurement_missing",))
+                return PackedBatchPlan(batch_hash, calldata, batch.asset, batch.amount, batch.target_block, tuple(r.route_id for r in rows), True, None, None, None, None, False, None, ("packed_gas_measurement_missing",))
             gas_used = max(gas_values)
             gas_price = await rpc.gas_price()
             nonce = await rpc.nonce(settings.executor_owner_address)
@@ -129,12 +131,38 @@ class PackedBatchFinalizer:
             min_candidate_profit = min(int(r.execution["packed_candidate"]["min_profit"]) for r in rows)
             conservative_net = min_candidate_profit - gas_asset
             if conservative_net > 0:
+                adaptive = None
+                eligible = True
+                if settings.adaptive_submission_enabled:
+                    import time
+                    observed_ms = observed_at_unix_ms if observed_at_unix_ms is not None else int(time.time() * 1000)
+                    now_ms = now_unix_ms if now_unix_ms is not None else int(time.time() * 1000)
+                    decision = evaluate_adaptive_submission(
+                        deterministic_net_profit_units=conservative_net,
+                        observed_at_unix_ms=observed_ms,
+                        now_unix_ms=now_ms,
+                        expected_execution_latency_ms=settings.expected_execution_latency_ms,
+                        survival_window_ms=settings.opportunity_survival_window_ms,
+                        inclusion_probability_bps=settings.inclusion_probability_bps,
+                        expected_failure_cost_units=settings.expected_failure_cost_asset_units,
+                        safety_margin_units=settings.submission_safety_margin_asset_units,
+                    )
+                    adaptive = decision.to_dict()
+                    eligible = decision.eligible
+                    if decision.blocker:
+                        blockers.append(decision.blocker)
                 return PackedBatchPlan(
                     batch_hash, calldata, batch.asset, batch.amount, batch.target_block,
                     tuple(r.route_id for r in rows), True, sim.gas_used, estimate,
-                    gas_asset, conservative_net, True, tuple(blockers),
+                    gas_asset, conservative_net, eligible, adaptive, tuple(blockers),
                 )
-            blockers.append(f"trimmed_low_ev_candidate:{rows[-1].route_id}")
-            rows = rows[:-1]
+            # `conservative_net` is bound by the *smallest* `min_profit` in the menu, because the
+            # contract enforces only the selected candidate's floor. `rows` is ordered by each
+            # route's own post-gas EV, which is a different ordering (per-route gas differs while
+            # the packed transaction has a single shared cost), so dropping the tail can leave the
+            # binding candidate in place and discard a menu that was profitable without it.
+            trimmed = min(rows, key=lambda r: (int(r.execution["packed_candidate"]["min_profit"]), r.route_id))
+            blockers.append(f"trimmed_low_ev_candidate:{trimmed.route_id}")
+            rows = [r for r in rows if r.route_id != trimmed.route_id]
 
-        return PackedBatchPlan(None, None, None, None, None, (), False, None, None, None, None, False, tuple(blockers + ["no_profitable_packed_batch_after_exact_costs"]))
+        return PackedBatchPlan(None, None, None, None, None, (), False, None, None, None, None, False, None, tuple(blockers + ["no_profitable_packed_batch_after_exact_costs"]))

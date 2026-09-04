@@ -17,9 +17,17 @@ START_SELECTOR = "0x" + keccak(text="start((bytes32,address,uint256,uint256,uint
 START_PACKED_SELECTOR = "0x" + keccak(text="startPacked(bytes)")[:4].hex()
 SET_ADAPTER_SIGNATURE = "setAdapter(address,bool)"
 SET_TOKEN_SIGNATURE = "setToken(address,bool)"
+# The proxy upgrade. Strictly more dangerous than the allowlist calls beside it: it replaces
+# every line of logic behind the executor, and its bytes payload is delegatecalled immediately
+# afterwards. It is admitted here only because the reviewed-plan checks in validate_deployment
+# already pin the exact calldata -- destination, selector, implementation address and payload
+# all have to match the plan byte for byte -- so this entry widens what Clef will render an ABI
+# hint for, not what the gateway will agree to sign.
+UPGRADE_TO_AND_CALL_SIGNATURE = "upgradeToAndCall(address,bytes)"
 DEPLOYMENT_METHOD_SIGNATURES = {
     "0x" + keccak(text=SET_ADAPTER_SIGNATURE)[:4].hex(): SET_ADAPTER_SIGNATURE,
     "0x" + keccak(text=SET_TOKEN_SIGNATURE)[:4].hex(): SET_TOKEN_SIGNATURE,
+    "0x" + keccak(text=UPGRADE_TO_AND_CALL_SIGNATURE)[:4].hex(): UPGRADE_TO_AND_CALL_SIGNATURE,
 }
 
 

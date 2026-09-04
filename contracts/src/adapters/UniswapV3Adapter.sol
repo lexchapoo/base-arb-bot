@@ -5,27 +5,16 @@ import "../interfaces.sol";
 
 interface IUniswapV3RouterLegacy {
     struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 deadline;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
+        address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 deadline;
+        uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
     }
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
 
 interface IUniswapV3Router02 {
     struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
+        address tokenIn; address tokenOut; uint24 fee; address recipient;
+        uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96;
     }
     function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
 }
@@ -60,32 +49,30 @@ contract UniswapV3Adapter is IExchangeAdapter {
 
         uint256 beforeOut = IERC20(tokenOut).balanceOf(recipient);
         if (router02) {
-            IUniswapV3Router02(router)
-                .exactInputSingle(
-                    IUniswapV3Router02.ExactInputSingleParams({
-                        tokenIn: tokenIn,
-                        tokenOut: tokenOut,
-                        fee: fee,
-                        recipient: recipient,
-                        amountIn: amountIn,
-                        amountOutMinimum: minOut,
-                        sqrtPriceLimitX96: sqrtPriceLimitX96
-                    })
-                );
+            IUniswapV3Router02(router).exactInputSingle(
+                IUniswapV3Router02.ExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: fee,
+                    recipient: recipient,
+                    amountIn: amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: sqrtPriceLimitX96
+                })
+            );
         } else {
-            IUniswapV3RouterLegacy(router)
-                .exactInputSingle(
-                    IUniswapV3RouterLegacy.ExactInputSingleParams({
-                        tokenIn: tokenIn,
-                        tokenOut: tokenOut,
-                        fee: fee,
-                        recipient: recipient,
-                        deadline: block.timestamp,
-                        amountIn: amountIn,
-                        amountOutMinimum: minOut,
-                        sqrtPriceLimitX96: sqrtPriceLimitX96
-                    })
-                );
+            IUniswapV3RouterLegacy(router).exactInputSingle(
+                IUniswapV3RouterLegacy.ExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: fee,
+                    recipient: recipient,
+                    deadline: block.timestamp,
+                    amountIn: amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: sqrtPriceLimitX96
+                })
+            );
         }
         uint256 afterOut = IERC20(tokenOut).balanceOf(recipient);
         amountOut = afterOut - beforeOut;

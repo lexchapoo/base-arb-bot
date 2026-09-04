@@ -51,8 +51,8 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Build
         run: cd contracts && forge build
-      - name: Test (excludes Base mainnet fork; that needs an RPC secret)
-        run: cd contracts && forge test --no-match-path 'test/BaseMainnetFork.t.sol' -vvv
+      - name: Test (excludes Base mainnet forks; those need an RPC secret)
+        run: cd contracts && forge test --no-match-path 'test/*Fork.t.sol' -vvv
 
   fork-test:
     name: Solidity (Base mainnet fork)
@@ -66,4 +66,10 @@ jobs:
       - name: Fork tests against pinned Base state
         env:
           BASE_HTTP_RPC: ${{ secrets.BASE_HTTP_RPC }}
-        run: cd contracts && forge test --match-path 'test/BaseMainnetFork.t.sol' -vvv
+          # Drive the live-proxy upgrade rehearsal in BaseProxyUpgradeFork.t.sol. Optional:
+          # a missing secret arrives as an empty string, which the test reads as "no proxy
+          # configured" and reports as skipped rather than passed. Set both to have CI
+          # rehearse the upgrade against the real deployment on every push.
+          EXECUTOR_ADDRESS: ${{ secrets.EXECUTOR_ADDRESS }}
+          EXECUTOR_OWNER_ADDRESS: ${{ secrets.EXECUTOR_OWNER_ADDRESS }}
+        run: cd contracts && forge test --match-path 'test/*Fork.t.sol' -vvv

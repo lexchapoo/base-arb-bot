@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from .adapters.base import Quote, QuoteAdapter
 from .config import settings
-from .event_graph import Cycle, LivePoolGraph, PoolMetadata
+from .event_graph import Cycle, LivePoolGraph, PoolMetadata, canonical_venue
 from .execution import ExecutionFinalizer
 
 ERC20_BALANCE_ABI = [{
@@ -54,6 +54,11 @@ class AdapterRegistry:
             self._adapters["uniswap-v3"] = UniswapV3Quoter(
                 settings.base_http_rpc, settings.uniswap_v3_quoter_v2, "uniswap-v3"
             )
+        if settings.aerodrome_slipstream_quoter:
+            from .adapters.slipstream import SlipstreamQuoter
+            self._adapters["aerodrome-slipstream"] = SlipstreamQuoter(
+                settings.base_http_rpc, settings.aerodrome_slipstream_quoter, "aerodrome-slipstream"
+            )
         if settings.aerodrome_router and settings.aerodrome_factory:
             from .adapters.aerodrome import AerodromeRouter
             self._adapters["aerodrome"] = AerodromeRouter(
@@ -63,37 +68,40 @@ class AdapterRegistry:
                 "aerodrome",
             )
 
-    @staticmethod
-    def canonical_venue(venue: str) -> str:
-        v = venue.strip().lower()
-        if "slipstream" in v:
-            return "aerodrome-slipstream"
-        if "uniswap" in v:
-            return "uniswap-v3"
-        if "aerodrome" in v:
-            return "aerodrome"
-        return v
+    #: Single definition, shared with the API request models (see event_graph.canonical_venue).
+    canonical_venue = staticmethod(canonical_venue)
 
     def get(self, venue: str) -> QuoteAdapter | None:
         return self._adapters.get(self.canonical_venue(venue))
 
 
 class LiveBalanceProvider:
-    def __init__(self, rpc_url: str) -> None:
+    def __init__(self, rpc_url: str | list[str], attempt_timeout_seconds: float = 1.5) -> None:
         from web3 import AsyncWeb3
-        from web3.providers import AsyncHTTPProvider
+        from .multicall import RotatingProviders
         self._async_web3 = AsyncWeb3
-        self.w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
+        self.providers = RotatingProviders(urls, attempt_timeout_seconds)
+        # Preserved for callers/tests that reach for a single client.
+        self.w3 = self.providers._clients[0]
 
-    async def token_balance(self, token: str, account: str, block_identifier: str = "pending") -> int:
-        contract = self.w3.eth.contract(
-            address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
-        )
-        return int(
-            await contract.functions.balanceOf(
-                self._async_web3.to_checksum_address(account)
-            ).call(block_identifier=block_identifier)
-        )
+    async def token_balance(self, token: str, account: str, block_identifier: str | None = None) -> int:
+        block_identifier = block_identifier or settings.quote_block_tag
+        # This is the fallback path taken when the multicall prefetch did not supply the balance,
+        # so it runs precisely when the provider is already under pressure. Failing over to the
+        # next endpoint keeps a rate limit from turning into `live_balance_query_failed`, which
+        # discards the route entirely.
+        async def _call(w3):
+            contract = w3.eth.contract(
+                address=self._async_web3.to_checksum_address(token), abi=ERC20_BALANCE_ABI
+            )
+            return int(
+                await contract.functions.balanceOf(
+                    self._async_web3.to_checksum_address(account)
+                ).call(block_identifier=block_identifier)
+            )
+
+        return await self.providers.attempt(_call)
 
 
 class RouteOptimizer:
@@ -127,11 +135,14 @@ class RouteOptimizer:
     @staticmethod
     def _pool_kwargs(pool: PoolMetadata) -> dict:
         venue = AdapterRegistry.canonical_venue(pool.venue)
+        tag = settings.quote_block_tag
         if venue == "uniswap-v3":
-            return {"fee": pool.fee, "block_identifier": "pending"}
+            return {"fee": pool.fee, "block_identifier": tag}
+        if venue == "aerodrome-slipstream":
+            return {"tick_spacing": pool.tick_spacing, "block_identifier": tag}
         if venue == "aerodrome":
-            return {"stable": pool.stable, "block_identifier": "pending"}
-        return {"block_identifier": "pending"}
+            return {"stable": pool.stable, "block_identifier": tag}
+        return {"block_identifier": tag}
 
     async def _quote_cycle(self, cycle: Cycle, amount_in: int) -> tuple[int, list[Quote]]:
         amount = amount_in
@@ -218,7 +229,7 @@ class RouteOptimizer:
             account = pool.lower().removeprefix("0x").rjust(64, "0")
             calls.append((token, bytes.fromhex("70a08231" + account)))  # balanceOf(address)
         try:
-            results = await self._multicall().aggregate3(calls, "pending")
+            results = await self._multicall().aggregate3(calls, settings.quote_block_tag)
         except Exception:
             return {}
         balances: dict[tuple[str, str], int] = {}
@@ -238,7 +249,11 @@ class RouteOptimizer:
     def _multicall(self) -> "MulticallClient":
         if self._multicall_client is None:
             from .multicall import MulticallClient
-            self._multicall_client = MulticallClient(settings.base_http_rpc)
+            from .multicall import endpoint_list
+            _urls = endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+            self._multicall_client = MulticallClient(
+                _urls, attempt_timeout_seconds=settings.quote_timeout_seconds / max(1, 2 * len(_urls))
+            )
         return self._multicall_client
 
     async def _batched_quotes(
@@ -262,7 +277,9 @@ class RouteOptimizer:
             token_out = cycle.tokens[hop + 1]
             calls = [adapter.encode_quote(token_in, token_out, current[i], **kwargs) for i in surviving]
             try:
-                results = await mc.aggregate3(calls, block_identifier=kwargs.get("block_identifier", "pending"))
+                results = await mc.aggregate3(
+                    calls, block_identifier=kwargs.get("block_identifier", settings.quote_block_tag)
+                )
             except Exception as exc:
                 return {}, [f"multicall_failed:{type(exc).__name__}"]
             next_surviving: list[int] = []
@@ -330,8 +347,15 @@ class RouteOptimizer:
             # Not prefetched (or batching unavailable): fall back to a live query.
             try:
                 if self.balance_provider is None:
-                    self.balance_provider = LiveBalanceProvider(settings.base_http_rpc)
-                upper = await self.balance_provider.token_balance(token_in, first_pool.address, "pending")
+                    from .multicall import endpoint_list
+                    _urls = endpoint_list(settings.base_http_rpc, settings.base_http_rpcs)
+                    self.balance_provider = LiveBalanceProvider(
+                        _urls,
+                        attempt_timeout_seconds=settings.quote_timeout_seconds / max(1, 2 * len(_urls)),
+                    )
+                upper = await self.balance_provider.token_balance(
+                    token_in, first_pool.address, settings.quote_block_tag
+                )
             except Exception as exc:
                 return None, None, [], [f"live_balance_query_failed:{type(exc).__name__}"]
         if upper <= 0:
@@ -405,6 +429,8 @@ class RouteOptimizer:
                 blockers.append(f"missing_pool_fee:{pool.address}")
             if canonical == "aerodrome" and pool.stable is None:
                 blockers.append(f"missing_stable_flag:{pool.address}")
+            if canonical == "aerodrome-slipstream" and pool.tick_spacing is None:
+                blockers.append(f"missing_tick_spacing:{pool.address}")
         if blockers:
             return RouteEvaluation(route_id, tuple(p.address for p in cycle.pools), cycle.tokens, None, None, None, tuple(), None, False, False, tuple(sorted(set(blockers))), tuple(), {})
 
@@ -432,6 +458,9 @@ class RouteOptimizer:
         else:
             final = await self.execution_finalizer.finalize(cycle, amount_in, amount_out, quotes, observed_block)
             execution = final.to_dict()
+            comparison = await self._provider_comparison(cycle, amount_in, amount_out, quotes, observed_block, final)
+            if comparison is not None:
+                execution["provider_comparison"] = comparison
             packed_builder = getattr(self.execution_finalizer, "packed_candidate_dict", None)
             if packed_builder is not None:
                 packed_candidate = packed_builder(cycle, amount_in, amount_out, quotes, final)
@@ -456,6 +485,65 @@ class RouteOptimizer:
             quote_metadata=tuple(q.metadata for q in quotes),
             execution=execution,
         )
+
+    async def _provider_comparison(
+        self, cycle, amount_in, amount_out, quotes, observed_block, primary
+    ) -> dict | None:
+        """Price the same route against the other flash-loan venue, for comparison only.
+
+        Paired by construction -- same cycle, same quotes, same block, same sizing -- so the
+        only variable is the venue. That is what makes a handful of samples informative;
+        alternating providers across different routes would need far more of them to say
+        anything, because route-to-route variance dwarfs a 5bp fee difference.
+
+        Recorded inside the primary row's execution_json rather than as a second
+        route_evaluations row. A second row would have to be joined back to its twin, and
+        would be one forgotten WHERE clause away from being counted as a real candidate.
+
+        Instrumentation must never change the outcome it is measuring: any failure here is
+        swallowed and reported as a field, never raised into the evaluation.
+        """
+        from .execution import FlashProvider
+
+        if not settings.shadow_compare_providers:
+            return None
+        # Never in live trading: it doubles the RPC cost of every evaluation to compute a
+        # number nothing acts on.
+        if not settings.dry_run or settings.live_trading:
+            return None
+        if primary.flash_provider is None:
+            return None
+        try:
+            primary_provider = FlashProvider.parse(primary.flash_provider)
+        except ValueError:
+            return None
+        other = FlashProvider.AAVE if primary_provider is FlashProvider.MORPHO else FlashProvider.MORPHO
+        try:
+            alt = await self.execution_finalizer.finalize(
+                cycle, amount_in, amount_out, quotes, observed_block, provider=other
+            )
+        except Exception as exc:
+            return {"provider": other.name.lower(), "error": f"{type(exc).__name__}: {exc}"}
+
+        delta = None
+        if (
+            alt.deterministic_net_profit_units is not None
+            and primary.deterministic_net_profit_units is not None
+        ):
+            delta = alt.deterministic_net_profit_units - primary.deterministic_net_profit_units
+        return {
+            "provider": other.name.lower(),
+            "baseline_provider": primary.flash_provider,
+            "flashloan_premium_bps": alt.flashloan_premium_bps,
+            "flashloan_premium_units": alt.flashloan_premium_units,
+            "deterministic_net_profit_units": alt.deterministic_net_profit_units,
+            "net_profit_delta_units": delta,
+            "submission_eligible": alt.submission_eligible,
+            # The case the whole exercise is looking for: a route the baseline venue's fee
+            # made unprofitable that the other venue would have cleared.
+            "unblocked_by_switch": bool(alt.submission_eligible and not primary.submission_eligible),
+            "blockers": list(alt.blockers),
+        }
 
     def reject_affected(
         self,

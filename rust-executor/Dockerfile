@@ -4,6 +4,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml .
+# Cargo.lock is copied and --locked enforced so the image resolves the exact audited
+# dependency set (including the pinned h2 fix for RUSTSEC-2026-0258) on every rebuild.
 COPY Cargo.lock .
 COPY src ./src
 RUN cargo build --release --locked

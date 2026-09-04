@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from enum import IntEnum
 from typing import Any
 
 import httpx
@@ -8,6 +9,29 @@ import httpx
 from .adapters.base import Quote
 from .config import settings
 from .event_graph import Cycle, LivePoolGraph, PoolMetadata
+
+
+class FlashProvider(IntEnum):
+    """Mirrors BaseArbExecutor.FlashProvider; the on-chain enum encodes as uint8.
+
+    NONE is the executor's idle marker and is never submittable -- it exists so a callback can
+    tell "no borrow of my kind is in flight" from "an Aave borrow is". Keep the ordinals in
+    step with the Solidity enum: they are the wire format, not a label.
+    """
+
+    NONE = 0
+    AAVE = 1
+    MORPHO = 2
+
+    @classmethod
+    def parse(cls, raw: str) -> "FlashProvider":
+        """Map the FLASH_PROVIDER setting onto the enum, refusing anything unroutable."""
+        key = (raw or "").strip().lower()
+        if key in ("aave", "aave-v3", "aavev3"):
+            return cls.AAVE
+        if key == "morpho":
+            return cls.MORPHO
+        raise ValueError(f"unsupported flash provider {raw!r}; expected 'aave' or 'morpho'")
 
 
 EXECUTOR_ABI = [
@@ -35,7 +59,8 @@ EXECUTOR_ABI = [
                 ],
                 "name": "route",
                 "type": "tuple",
-            }
+            },
+            {"name": "provider", "type": "uint8"},
         ],
         "name": "start",
         "outputs": [],
@@ -43,7 +68,7 @@ EXECUTOR_ABI = [
         "type": "function",
     },
     {
-        "inputs": [{"name": "packed", "type": "bytes"}],
+        "inputs": [{"name": "packed", "type": "bytes"}, {"name": "provider", "type": "uint8"}],
         "name": "startPacked",
         "outputs": [],
         "stateMutability": "nonpayable",
@@ -60,6 +85,9 @@ AAVE_POOL_ABI = [
         "type": "function",
     },
     {
+        # Aave v3 `IPool.getReserveData` returns `ReserveDataLegacy` (15 static fields), not the
+        # extended struct exposed by `getReserveDataExtended`. Verified against the deployed Base
+        # mainnet Pool, which returns exactly 480 bytes (15 words) for this call.
         "inputs": [{"name": "asset", "type": "address"}],
         "name": "getReserveData",
         "outputs": [
@@ -73,7 +101,6 @@ AAVE_POOL_ABI = [
                     {"name": "__deprecatedStableBorrowRate", "type": "uint128"},
                     {"name": "lastUpdateTimestamp", "type": "uint40"},
                     {"name": "id", "type": "uint16"},
-                    {"name": "liquidationGracePeriodUntil", "type": "uint40"},
                     {"name": "aTokenAddress", "type": "address"},
                     {"name": "__deprecatedStableDebtTokenAddress", "type": "address"},
                     {"name": "variableDebtTokenAddress", "type": "address"},
@@ -81,7 +108,6 @@ AAVE_POOL_ABI = [
                     {"name": "accruedToTreasury", "type": "uint128"},
                     {"name": "unbacked", "type": "uint128"},
                     {"name": "isolationModeTotalDebt", "type": "uint128"},
-                    {"name": "virtualUnderlyingBalance", "type": "uint128"},
                 ],
                 "name": "",
                 "type": "tuple",
@@ -122,6 +148,21 @@ class AaveSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class FlashLoanSnapshot:
+    """What one flash-loan venue can currently lend, and what it charges for it.
+
+    `source` is the address that will actually be borrowed from, so the caller can verify the
+    right contract rather than assuming Aave.
+    """
+
+    provider: FlashProvider
+    premium_bps: int
+    available_liquidity: int
+    flashloan_enabled: bool
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
 class SimulationResult:
     success: bool
     gas_used: int | None
@@ -144,6 +185,9 @@ class ExecutionFinalization:
     l1_fee_upper_bound_wei: int | None
     total_native_fee_wei: int | None
     gas_cost_asset_units: int | None
+    # Which venue this row was priced against. Recorded rather than inferred, because the
+    # premium alone cannot distinguish "Morpho" from "Aave with the fee governance-zeroed".
+    flash_provider: str | None
     flashloan_premium_bps: int | None
     flashloan_premium_units: int | None
     available_flash_liquidity: int | None
@@ -334,10 +378,40 @@ class ContractRuntime:
         reserve = await p.functions.getReserveData(self.checksum(asset)).call(block_identifier="pending")
         configuration = reserve[0][0] if isinstance(reserve[0], (tuple, list)) else reserve[0]
         flashloan_enabled = bool((int(configuration) >> 63) & 1)
-        a_token = self.checksum(reserve[9])
+        # ReserveDataLegacy index 8 is `aTokenAddress`; index 9 is the deprecated stable debt token.
+        a_token = self.checksum(reserve[8])
         token = self.w3.eth.contract(address=self.checksum(asset), abi=ERC20_ABI)
         available = int(await token.functions.balanceOf(a_token).call(block_identifier="pending"))
         return AaveSnapshot(premium, available, flashloan_enabled, a_token)
+
+    async def morpho_snapshot(self, morpho: str, asset: str) -> FlashLoanSnapshot:
+        """Morpho Blue lends whatever the singleton holds, for free.
+
+        Deliberately one call where Aave needs three. There is no premium to read (the core is
+        immutable and charges none) and no per-asset enable flag to decode -- Morpho will lend
+        any token it holds, so "can we borrow this?" collapses to "is the balance big enough?",
+        which the caller checks against `available_liquidity` anyway.
+        """
+        token = self.w3.eth.contract(address=self.checksum(asset), abi=ERC20_ABI)
+        available = int(await token.functions.balanceOf(self.checksum(morpho)).call(block_identifier="pending"))
+        return FlashLoanSnapshot(
+            provider=FlashProvider.MORPHO, premium_bps=0, available_liquidity=available,
+            flashloan_enabled=True, source=self.checksum(morpho),
+        )
+
+    async def flash_snapshot(self, provider: FlashProvider, *, pool: str, morpho: str, asset: str) -> FlashLoanSnapshot:
+        if provider is FlashProvider.MORPHO:
+            if not morpho:
+                raise ValueError("MORPHO_ADDRESS must be set when FLASH_PROVIDER=morpho")
+            return await self.morpho_snapshot(morpho, asset)
+        if provider is FlashProvider.AAVE:
+            aave = await self.aave_snapshot(pool, asset)
+            return FlashLoanSnapshot(
+                provider=FlashProvider.AAVE, premium_bps=aave.premium_bps,
+                available_liquidity=aave.available_liquidity,
+                flashloan_enabled=aave.flashloan_enabled, source=self.checksum(pool),
+            )
+        raise ValueError(f"{provider!r} is not a borrowable provider")
 
     async def l1_fee_upper_bound(self, oracle: str, tx_size: int) -> int:
         contract = self.w3.eth.contract(address=self.checksum(oracle), abi=GAS_ORACLE_ABI)
@@ -349,6 +423,11 @@ class ContractRuntime:
             if pool.fee is None:
                 raise RuntimeError(f"missing fee for {pool.address}")
             return self.encode(["uint24", "uint160"], [pool.fee, 0])
+        if "slipstream" in venue:
+            # Slipstream's pool key is tickSpacing (int24), not fee.
+            if pool.tick_spacing is None:
+                raise RuntimeError(f"missing tick spacing for {pool.address}")
+            return self.encode(["int24", "uint160"], [int(pool.tick_spacing), 0])
         if "aerodrome" in venue and "slipstream" not in venue:
             if pool.stable is None:
                 raise RuntimeError(f"missing stable flag for {pool.address}")
@@ -399,7 +478,12 @@ class ContractRuntime:
         target_block: int,
         deadline: int,
         legs: list[dict[str, Any]],
+        provider: FlashProvider = FlashProvider.AAVE,
     ) -> tuple[str, str]:
+        # Not part of the route hash on purpose: the provider changes where the principal comes
+        # from, never what the route does, and start() is onlyOwner so it is not attacker input.
+        if provider is FlashProvider.NONE:
+            raise ValueError("FlashProvider.NONE is the idle marker, not a borrowable venue")
         route_hash = self.route_hash(
             asset=asset,
             amount=amount,
@@ -427,18 +511,22 @@ class ContractRuntime:
             ],
         }
         contract = self.w3.eth.contract(address=self.checksum(executor), abi=EXECUTOR_ABI)
-        calldata = contract.encode_abi("start", args=[route])
+        calldata = contract.encode_abi("start", args=[route, int(provider)])
         route_hash_hex = route_hash.hex()
         if not route_hash_hex.startswith("0x"):
             route_hash_hex = "0x" + route_hash_hex
         return calldata, route_hash_hex
 
 
-    def encode_start_packed(self, *, executor: str, packed: bytes) -> tuple[str, str]:
+    def encode_start_packed(
+        self, *, executor: str, packed: bytes, provider: FlashProvider = FlashProvider.AAVE
+    ) -> tuple[str, str]:
         if not packed:
             raise ValueError("packed batch cannot be empty")
+        if provider is FlashProvider.NONE:
+            raise ValueError("FlashProvider.NONE is the idle marker, not a borrowable venue")
         contract = self.w3.eth.contract(address=self.checksum(executor), abi=EXECUTOR_ABI)
-        calldata = contract.encode_abi("startPacked", args=[packed])
+        calldata = contract.encode_abi("startPacked", args=[packed, int(provider)])
         # Ethereum uses Keccak-256; Web3.keccak matches Solidity keccak256.
         batch_hash = self.Web3.keccak(packed).hex()
         if not batch_hash.startswith("0x"):
@@ -555,6 +643,8 @@ class ExecutionFinalizer:
         canonical = self.registry.canonical_venue(pool.venue)
         if canonical == "uniswap-v3":
             return settings.uniswap_v3_adapter_address
+        if canonical == "aerodrome-slipstream":
+            return settings.aerodrome_slipstream_adapter_address
         if canonical == "aerodrome":
             return settings.aerodrome_adapter_address
         raise RuntimeError(f"no execution adapter configured for venue={pool.venue}")
@@ -566,8 +656,18 @@ class ExecutionFinalizer:
         amount_out: int,
         quotes: list[Quote],
         observed_block: int | None,
+        provider: FlashProvider | None = None,
     ) -> ExecutionFinalization:
+        """`provider` overrides the configured venue for this one route, which is what lets a
+        shadow run price the same cycle against both without restarting the process."""
         blockers: list[str] = []
+        if provider is None:
+            try:
+                provider = FlashProvider.parse(settings.flash_provider)
+            except ValueError as exc:
+                return _empty_finalization((f"invalid_flash_provider:{exc}",))
+        if provider is FlashProvider.MORPHO and not settings.morpho_address:
+            return _empty_finalization(("morpho_address_not_configured",))
         ok, missing = self.configured()
         if not ok:
             return _empty_finalization(tuple(missing))
@@ -589,7 +689,9 @@ class ExecutionFinalizer:
                 return _empty_finalization(tuple(sorted(set(blockers))))
 
             await runtime.verify_contract(settings.executor_address)
-            await runtime.verify_contract(settings.aave_pool)
+            await runtime.verify_contract(
+                settings.morpho_address if provider is FlashProvider.MORPHO else settings.aave_pool
+            )
             await runtime.verify_contract(settings.gas_price_oracle)
             for address in set(adapter_addresses):
                 await runtime.verify_contract(address)
@@ -597,34 +699,47 @@ class ExecutionFinalizer:
             return _empty_finalization((f"contract_verification_failed:{type(exc).__name__}",))
 
         try:
-            aave = await runtime.aave_snapshot(settings.aave_pool, cycle.tokens[0])
+            flash = await runtime.flash_snapshot(
+                provider, pool=settings.aave_pool, morpho=settings.morpho_address, asset=cycle.tokens[0]
+            )
         except Exception as exc:
-            return _empty_finalization((f"aave_snapshot_failed:{type(exc).__name__}",))
-        if not aave.flashloan_enabled:
+            return _empty_finalization((f"flash_snapshot_failed:{type(exc).__name__}",))
+        # Aave's blocker strings are kept verbatim so existing dashboards and the shadow-run
+        # reports keep parsing; Morpho gets its own, because "disabled for asset" has no Morpho
+        # analogue -- the singleton lends any token it holds.
+        if not flash.flashloan_enabled:
             blockers.append("aave_flashloan_disabled_for_asset")
-        if amount_in > aave.available_liquidity:
-            blockers.append("insufficient_aave_flash_liquidity")
+        if amount_in > flash.available_liquidity:
+            blockers.append(
+                "insufficient_morpho_flash_liquidity"
+                if provider is FlashProvider.MORPHO
+                else "insufficient_aave_flash_liquidity"
+            )
         if blockers:
             return ExecutionFinalization(
+                flash_provider=provider.name.lower(),
                 calldata=None, route_hash=None, target_block=None, deadline=None,
                 simulation_gas_units=None, estimate_gas_units=None, gas_price_wei=None,
                 l2_fee_wei=None, l1_fee_upper_bound_wei=None, total_native_fee_wei=None,
-                gas_cost_asset_units=None, flashloan_premium_bps=aave.premium_bps,
-                flashloan_premium_units=None, available_flash_liquidity=aave.available_liquidity,
+                gas_cost_asset_units=None, flashloan_premium_bps=flash.premium_bps,
+                flashloan_premium_units=None, available_flash_liquidity=flash.available_liquidity,
                 deterministic_net_profit_units=None, simulation_success=False,
                 submission_eligible=False, blockers=tuple(blockers),
             )
 
-        premium_units = (amount_in * aave.premium_bps + 5_000) // 10_000
+        # Rounds half up, matching Aave's percentMul. Morpho reports 0 bps, so this is exactly
+        # zero there rather than an approximation of it.
+        premium_units = (amount_in * flash.premium_bps + 5_000) // 10_000
         pre_gas_profit = amount_out - amount_in - premium_units
         if pre_gas_profit <= 0:
             blockers.append("non_positive_profit_after_flashloan_premium")
             return ExecutionFinalization(
+                flash_provider=provider.name.lower(),
                 calldata=None, route_hash=None, target_block=None, deadline=None,
                 simulation_gas_units=None, estimate_gas_units=None, gas_price_wei=None,
                 l2_fee_wei=None, l1_fee_upper_bound_wei=None, total_native_fee_wei=None,
-                gas_cost_asset_units=None, flashloan_premium_bps=aave.premium_bps,
-                flashloan_premium_units=premium_units, available_flash_liquidity=aave.available_liquidity,
+                gas_cost_asset_units=None, flashloan_premium_bps=flash.premium_bps,
+                flashloan_premium_units=premium_units, available_flash_liquidity=flash.available_liquidity,
                 deterministic_net_profit_units=pre_gas_profit, simulation_success=False,
                 submission_eligible=False, blockers=tuple(blockers),
             )
@@ -647,6 +762,7 @@ class ExecutionFinalizer:
                 )
 
             calldata, route_hash = runtime.encode_start(
+                provider=provider,
                 executor=settings.executor_address,
                 asset=cycle.tokens[0],
                 amount=amount_in,
@@ -665,11 +781,12 @@ class ExecutionFinalizer:
             if not simulation.success:
                 blockers.append(f"executor_simulation_failed:{simulation.error or 'unknown'}")
                 return ExecutionFinalization(
+                    flash_provider=provider.name.lower(),
                     calldata=calldata, route_hash=route_hash, target_block=target_block, deadline=deadline,
                     simulation_gas_units=simulation.gas_used, estimate_gas_units=None, gas_price_wei=None,
                     l2_fee_wei=None, l1_fee_upper_bound_wei=None, total_native_fee_wei=None,
-                    gas_cost_asset_units=None, flashloan_premium_bps=aave.premium_bps,
-                    flashloan_premium_units=premium_units, available_flash_liquidity=aave.available_liquidity,
+                    gas_cost_asset_units=None, flashloan_premium_bps=flash.premium_bps,
+                    flashloan_premium_units=premium_units, available_flash_liquidity=flash.available_liquidity,
                     deterministic_net_profit_units=None, simulation_success=False,
                     submission_eligible=False, blockers=tuple(blockers),
                 )
@@ -703,6 +820,7 @@ class ExecutionFinalizer:
                 blockers.append("non_positive_profit_after_full_transaction_cost")
 
             return ExecutionFinalization(
+                flash_provider=provider.name.lower(),
                 calldata=calldata,
                 route_hash=route_hash,
                 target_block=target_block,
@@ -714,9 +832,9 @@ class ExecutionFinalizer:
                 l1_fee_upper_bound_wei=l1_fee,
                 total_native_fee_wei=total_native_fee,
                 gas_cost_asset_units=gas_asset_units,
-                flashloan_premium_bps=aave.premium_bps,
+                flashloan_premium_bps=flash.premium_bps,
                 flashloan_premium_units=premium_units,
-                available_flash_liquidity=aave.available_liquidity,
+                available_flash_liquidity=flash.available_liquidity,
                 deterministic_net_profit_units=deterministic_net,
                 simulation_success=True,
                 submission_eligible=deterministic_net > 0,
@@ -725,18 +843,20 @@ class ExecutionFinalizer:
         except Exception as exc:
             blockers.append(f"execution_finalization_failed:{type(exc).__name__}")
             return ExecutionFinalization(
+                flash_provider=provider.name.lower(),
                 calldata=None, route_hash=None, target_block=None, deadline=None,
                 simulation_gas_units=None, estimate_gas_units=None, gas_price_wei=None,
                 l2_fee_wei=None, l1_fee_upper_bound_wei=None, total_native_fee_wei=None,
-                gas_cost_asset_units=None, flashloan_premium_bps=aave.premium_bps,
-                flashloan_premium_units=premium_units, available_flash_liquidity=aave.available_liquidity,
+                gas_cost_asset_units=None, flashloan_premium_bps=flash.premium_bps,
+                flashloan_premium_units=premium_units, available_flash_liquidity=flash.available_liquidity,
                 deterministic_net_profit_units=None, simulation_success=False,
                 submission_eligible=False, blockers=tuple(sorted(set(blockers))),
             )
 
 
-def _empty_finalization(blockers: tuple[str, ...]) -> ExecutionFinalization:
+def _empty_finalization(blockers: tuple[str, ...], provider: "FlashProvider | None" = None) -> ExecutionFinalization:
     return ExecutionFinalization(
+        flash_provider=provider.name.lower() if provider is not None else None,
         calldata=None,
         route_hash=None,
         target_block=None,

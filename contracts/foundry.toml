@@ -5,3 +5,8 @@ libs=["lib"]
 solc_version="0.8.24"
 optimizer=true
 optimizer_runs=200
+# Always emit the storage layout, not just when `forge inspect` happens to rebuild for it.
+# Without this the artifact can be cached without a layout, and `forge inspect storage-layout`
+# fails with "storage layout missing from artifact" -- which is how the upgrade-safety guard in
+# test_storage_layout_is_upgrade_safe.py ends up unable to check the one thing it exists for.
+extra_output=["storageLayout"]

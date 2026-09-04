@@ -41,7 +41,7 @@ async def database_report(database_url: str, started_at: datetime) -> dict:
             rows = (await connection.execute(text("""
                 SELECT route_id, blockers_json, deterministic_net_profit_units,
                        ev_ready, would_submit, evaluation_latency_ms,
-                       provider_disagreement
+                       provider_disagreement, flash_provider, execution_json
                 FROM route_evaluations
                 WHERE created_at >= :started
                 ORDER BY id DESC
@@ -84,7 +84,66 @@ async def database_report(database_url: str, started_at: datetime) -> dict:
             "measured": sum(row["provider_disagreement"] is not None for row in rows),
             "detected": sum(row["provider_disagreement"] is True for row in rows),
         },
+        "flash_providers": flash_provider_report(rows),
         "non_dry_submissions": non_dry,
+    }
+
+
+def flash_provider_report(rows) -> dict:
+    """Which venue routes were priced against, and what the other one would have done.
+
+    Two separate things, deliberately kept apart:
+
+      * `priced_against` counts rows per venue. That is just bookkeeping -- it tells you the
+        run was configured the way you thought it was.
+      * `comparison` is the actual A/B. Each sample is a paired measurement written by
+        RouteOptimizer._provider_comparison: the same route, same quotes, same block, priced
+        both ways. Unpaired counts across different routes would be near-meaningless here,
+        because route-to-route profit variance is orders of magnitude larger than a 5bp fee.
+
+    `would_unblock` is the number that decides whether switching venue is worth anything: the
+    routes the baseline's premium made unprofitable that the alternative would have cleared.
+    Zero of those over a full run means the fee is not what is standing between this bot and a
+    fill, whatever the fee happens to be.
+    """
+    priced: Counter[str] = Counter()
+    samples: list[dict] = []
+    for row in rows:
+        priced[row["flash_provider"] or "unrecorded"] += 1
+        try:
+            execution = json.loads(row["execution_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        comparison = execution.get("provider_comparison")
+        if isinstance(comparison, dict):
+            samples.append(comparison)
+
+    deltas = [
+        int(sample["net_profit_delta_units"])
+        for sample in samples
+        if sample.get("net_profit_delta_units") is not None
+    ]
+    errors: Counter[str] = Counter(
+        sample["error"].split(":")[0] for sample in samples if sample.get("error")
+    )
+    return {
+        "priced_against": dict(priced.most_common()),
+        "comparison": {
+            "enabled": bool(samples),
+            "alternative": next((s.get("provider") for s in samples if s.get("provider")), None),
+            "paired_samples": len(samples),
+            "errored_samples": dict(errors.most_common()),
+            "net_profit_delta_units": {
+                "samples": len(deltas),
+                "min": min(deltas) if deltas else None,
+                "median": int(statistics.median(deltas)) if deltas else None,
+                "max": max(deltas) if deltas else None,
+                # Signed sum: what the whole run would have gained (or lost) on the switch.
+                "total": sum(deltas) if deltas else None,
+            },
+            # The headline: routes the baseline could not submit that the alternative could.
+            "would_unblock": sum(bool(s.get("unblocked_by_switch")) for s in samples),
+        },
     }
 
 
@@ -143,6 +202,11 @@ async def observe(duration_seconds: int, poll_seconds: int, smoke: bool) -> int:
         "provider_disagreement_measured": db["provider_disagreement"]["measured"] > 0,
         "no_live_submissions": db["non_dry_submissions"] == 0,
     }
+    # Only gated when the comparison was actually asked for. Turning it on and collecting zero
+    # paired samples means the wiring is broken, which is a silent failure the report would
+    # otherwise render as a tidy block of nulls.
+    if env_true("SHADOW_COMPARE_PROVIDERS"):
+        gate["provider_comparison_observed"] = db["flash_providers"]["comparison"]["paired_samples"] > 0
     report = {
         "mode": "shadow-smoke" if smoke else "shadow",
         "started_at": started_at.isoformat(),

@@ -28,7 +28,7 @@ contract BaseArbExecutorInvariantTest {
     address[] private targets;
 
     function setUp() public {
-        executor = new BaseArbExecutor(address(new MockPool(10)));
+        executor = new BaseArbExecutor(address(new MockPool(10)), address(0));
         handler = new UnprivilegedPauseHandler(executor);
         targets.push(address(handler));
     }

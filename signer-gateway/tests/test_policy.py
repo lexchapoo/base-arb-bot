@@ -124,6 +124,13 @@ def test_deployment_method_signature_is_exactly_allowlisted():
         "to": EXECUTOR,
         "data": "0x3816a292" + "00" * 64,
     }) == "setToken(address,bool)"
+    # The proxy upgrade. Pinned by selector literal rather than recomputed from the signature,
+    # so a typo in the signature string cannot silently agree with itself here and admit a
+    # different method than the one reviewed.
+    assert deployment_method_signature({
+        "to": EXECUTOR,
+        "data": "0x4f1ef286" + "00" * 128,
+    }) == "upgradeToAndCall(address,bytes)"
     with pytest.raises(PolicyError, match="no reviewed ABI signature"):
         deployment_method_signature({"to": EXECUTOR, "data": "0xdeadbeef"})
 

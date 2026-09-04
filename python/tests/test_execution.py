@@ -3,7 +3,7 @@ import pytest
 from arb_bot.adapters.base import Quote
 from arb_bot.config import settings
 from arb_bot.event_graph import Cycle, LivePoolGraph, PoolMetadata
-from arb_bot.execution import AaveSnapshot, ExecutionFinalizer, SimulationResult
+from arb_bot.execution import AaveSnapshot, FlashLoanSnapshot, FlashProvider, ExecutionFinalizer, SimulationResult
 
 A="0x0000000000000000000000000000000000000001"
 B="0x0000000000000000000000000000000000000002"
@@ -23,14 +23,40 @@ class FakeRegistry:
     def get(self, v): return object()
 
 class FakeRuntime:
-    def __init__(self, liquidity=10_000): self.liquidity=liquidity
+    """Mirrors the real runtime's flash-loan surface, including the provider dispatch.
+
+    flash_snapshot is delegated to the same per-provider readers the real one uses, so a test
+    that switches provider exercises the dispatch rather than a stub that ignores it.
+    """
+
+    def __init__(self, liquidity=10_000, morpho_liquidity=1_000_000):
+        self.liquidity = liquidity
+        self.morpho_liquidity = morpho_liquidity
     async def verify_contract(self, address): return None
     async def aave_snapshot(self, pool, asset):
         return AaveSnapshot(premium_bps=10, available_liquidity=self.liquidity, flashloan_enabled=True, a_token=AD1)
+    async def morpho_snapshot(self, morpho, asset):
+        return FlashLoanSnapshot(
+            provider=FlashProvider.MORPHO, premium_bps=0,
+            available_liquidity=self.morpho_liquidity, flashloan_enabled=True, source=morpho,
+        )
+    async def flash_snapshot(self, provider, *, pool, morpho, asset):
+        if provider is FlashProvider.MORPHO:
+            if not morpho:
+                raise ValueError("MORPHO_ADDRESS must be set when FLASH_PROVIDER=morpho")
+            return await self.morpho_snapshot(morpho, asset)
+        aave = await self.aave_snapshot(pool, asset)
+        return FlashLoanSnapshot(
+            provider=FlashProvider.AAVE, premium_bps=aave.premium_bps,
+            available_liquidity=aave.available_liquidity,
+            flashloan_enabled=aave.flashloan_enabled, source=pool,
+        )
     async def l1_fee_upper_bound(self, oracle, tx_size): return 6
     def adapter_data(self, pool): return b""
     def checksum(self, address): return address
-    def encode_start(self, **kwargs): return "0x1234567890", "0x"+"11"*32
+    def encode_start(self, **kwargs):
+        self.last_encode_kwargs = dict(kwargs)
+        return "0x1234567890", "0x"+"11"*32
 
 class FakeRpc:
     async def chain_id(self): return 8453
@@ -56,6 +82,8 @@ def configured(monkeypatch):
     monkeypatch.setattr(settings,"gas_price_oracle",ORACLE)
     monkeypatch.setattr(settings,"uniswap_v3_adapter_address",AD1)
     monkeypatch.setattr(settings,"aerodrome_adapter_address",AD2)
+    monkeypatch.setattr(settings,"flash_provider","aave")
+    monkeypatch.setattr(settings,"morpho_address","")
 
 
 def cycle_and_quotes():
@@ -96,3 +124,182 @@ async def test_finalizer_blocks_insufficient_flash_liquidity(configured):
     result=await finalizer.finalize(cycle,1000,1200,quotes,101)
     assert result.submission_eligible is False
     assert "insufficient_aave_flash_liquidity" in result.blockers
+
+
+# Recorded `getReserveData(WETH)` return payload from the deployed Base mainnet Aave v3 Pool
+# (0xA238Dd80C259a72e81d7e4664a9801593F98d1c5). Kept as a fixed codec fixture: it exercises the
+# ABI shape only and never reaches a production path.
+BASE_AAVE_WETH_RESERVE_DATA = bytes.fromhex(
+    "100000000000000000000103e8000029428000022e9805dc85122904206c1f40"
+    "00000000000000000000000000000000000000000363e1ea061368f194268ab7"
+    "0000000000000000000000000000000000000000000fb14f2f9f310e86f5f49c"
+    "0000000000000000000000000000000000000000037b0e2bf60f0f7bcf7f0e1a"
+    "0000000000000000000000000000000000000000001498a09d3f854e6736140e"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000000000000000000000000006a8a984d"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000000000000d4a0e0b9149bcee3c920d2e00b5de09138fd8bb7"
+    "000000000000000000000000aed3b56fea82e809665f02acbcdec0816c75f4d9"
+    "00000000000000000000000024e6e0795b3c7c71d965fcc4f371803d1c1dca1e"
+    "00000000000000000000000086ab1c62a8bf868e1b3e1ab87d587aba6fbcbdc5"
+    "000000000000000000000000000000000000000000000000005d739cc694e3c1"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+BASE_AWETH = "0xd4a0e0b9149bcee3c920d2e00b5de09138fd8bb7"
+
+
+def test_aave_reserve_data_abi_matches_deployed_base_pool():
+    """The declared ABI must decode what Base's Pool actually returns.
+
+    A wider struct (for example the extended v3.2 shape) raises on decode, which turns every
+    route into `aave_snapshot_failed` and silently kills the whole execution path.
+    """
+    from eth_abi import decode
+    from eth_utils.abi import collapse_if_tuple
+
+    from arb_bot.execution import AAVE_POOL_ABI
+
+    entry = next(x for x in AAVE_POOL_ABI if x["name"] == "getReserveData")
+    output_type = collapse_if_tuple(entry["outputs"][0])
+    reserve = decode([output_type], BASE_AAVE_WETH_RESERVE_DATA)[0]
+
+    assert len(reserve) == 15
+    # Index 8 is aTokenAddress; reading index 9 would return the deprecated stable debt token
+    # and report ~zero available flash liquidity for every asset.
+    assert str(reserve[8]).lower() == BASE_AWETH
+    configuration = reserve[0][0] if isinstance(reserve[0], (tuple, list)) else reserve[0]
+    assert bool((int(configuration) >> 63) & 1) is True
+
+
+# --- Morpho as a second flash-loan provider ------------------------------------------
+
+MORPHO = "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"
+
+
+@pytest.mark.asyncio
+async def test_morpho_charges_no_premium_and_that_profit_stays_with_the_route(configured, monkeypatch):
+    """The whole reason for the second provider: 5bp of notional stops being a fixed cost.
+
+    Same cycle, same sizes as the Aave test above, which books a premium of 1 unit and nets
+    169. On Morpho the premium is 0 and that unit lands in net profit instead.
+    """
+    monkeypatch.setattr(settings, "flash_provider", "morpho")
+    monkeypatch.setattr(settings, "morpho_address", MORPHO)
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    result = await finalizer.finalize(cycle, 1000, 1200, quotes, 101)
+
+    assert result.flashloan_premium_bps == 0
+    assert result.flashloan_premium_units == 0
+    assert result.deterministic_net_profit_units == 170, "the 1-unit Aave premium should be kept"
+    assert result.submission_eligible is True
+    assert result.blockers == ()
+
+
+@pytest.mark.asyncio
+async def test_the_provider_reaches_the_calldata_encoder(configured, monkeypatch):
+    """Pricing against Morpho while submitting an Aave borrow would repay the wrong amount."""
+    monkeypatch.setattr(settings, "flash_provider", "morpho")
+    monkeypatch.setattr(settings, "morpho_address", MORPHO)
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    await finalizer.finalize(cycle, 1000, 1200, quotes, 101)
+
+    assert finalizer.contracts.last_encode_kwargs["provider"] is FlashProvider.MORPHO
+
+
+@pytest.mark.asyncio
+async def test_a_per_call_provider_overrides_the_configured_one(configured, monkeypatch):
+    """What a shadow run needs: both venues priced in one process, no restart.
+
+    The address must still be configured: the guard applies to a per-call override exactly as
+    it does to the configured default, so an override cannot route around it.
+    """
+    monkeypatch.setattr(settings, "morpho_address", MORPHO)
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    aave = await finalizer.finalize(cycle, 1000, 1200, quotes, 101, provider=FlashProvider.AAVE)
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    morpho = await finalizer.finalize(
+        cycle, 1000, 1200, quotes, 101, provider=FlashProvider.MORPHO
+    )
+
+    assert aave.flashloan_premium_units == 1
+    assert morpho.flashloan_premium_units == 0
+    assert morpho.deterministic_net_profit_units > aave.deterministic_net_profit_units
+
+
+@pytest.mark.asyncio
+async def test_morpho_without_an_address_is_refused_not_silently_downgraded(configured, monkeypatch):
+    """Falling back to Aave would bill a 5bp premium the operator did not ask for."""
+    monkeypatch.setattr(settings, "flash_provider", "morpho")
+    monkeypatch.setattr(settings, "morpho_address", "")
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    result = await finalizer.finalize(cycle, 1000, 1200, quotes, 101)
+
+    assert result.blockers == ("morpho_address_not_configured",)
+    assert result.submission_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_provider_name_blocks_rather_than_defaulting(configured, monkeypatch):
+    monkeypatch.setattr(settings, "flash_provider", "balancer")
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime()
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    result = await finalizer.finalize(cycle, 1000, 1200, quotes, 101)
+
+    assert len(result.blockers) == 1
+    assert result.blockers[0].startswith("invalid_flash_provider:")
+    assert result.submission_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_morpho_liquidity_shortfall_has_its_own_blocker(configured, monkeypatch):
+    """Aave's blocker strings stay verbatim for dashboards; Morpho gets a distinguishable one."""
+    monkeypatch.setattr(settings, "flash_provider", "morpho")
+    monkeypatch.setattr(settings, "morpho_address", MORPHO)
+    cycle, quotes = cycle_and_quotes()
+    finalizer = ExecutionFinalizer(LivePoolGraph(), FakeRegistry())
+    finalizer.contracts = FakeRuntime(morpho_liquidity=999)
+    finalizer.rpc = FakeRpc()
+    finalizer.converter = FakeConverter()
+
+    result = await finalizer.finalize(cycle, 1000, 1200, quotes, 101)
+
+    assert "insufficient_morpho_flash_liquidity" in result.blockers
+
+
+def test_flash_provider_ordinals_match_the_solidity_enum():
+    """These are the wire format for the uint8 argument, not display labels."""
+    assert (FlashProvider.NONE, FlashProvider.AAVE, FlashProvider.MORPHO) == (0, 1, 2)
+
+
+def test_none_is_never_encodable():
+    from arb_bot.execution import ContractRuntime  # noqa: F401  (import guard only)
+
+    with pytest.raises(ValueError):
+        FlashProvider.parse("none")
+
