@@ -105,6 +105,12 @@ async def main() -> int:
     ap.add_argument("--seed-blocks", type=int, default=500_000)
     ap.add_argument("--state", default="reports/liquidations/morpho-borrowers.json")
     ap.add_argument("--out", default="reports/liquidations")
+    ap.add_argument("--pg", default=os.environ.get("CURATE_PG",
+                    "postgresql://arb:arb@127.0.0.1:5432/arb"),
+                    help="pool registry, used to judge whether a market's collateral "
+                         "can actually be sold on-chain")
+    ap.add_argument("--at-risk-below", type=float, default=1.10,
+                    help="health threshold defining the at-risk band for the per-market table")
     a = ap.parse_args()
 
     w3 = AsyncWeb3(AsyncHTTPProvider(a.rpc))
@@ -220,7 +226,9 @@ async def main() -> int:
             if loan in tmeta and tmeta[loan][2] is not None:
                 usd = float(borrowed / (Decimal(10) ** tmeta[loan][0]) * tmeta[loan][2])
             rows.append({"market": mid, "user": user, "health": health,
-                         "debt_usd": usd, "loan": tmeta.get(loan, (0, "?", None))[1]})
+                         "debt_usd": usd, "loan": tmeta.get(loan, (0, "?", None))[1],
+                         "collateral": params[mid]["coll"],
+                         "lltv": params[mid]["lltv"] / 1e18})
         print(f"  positions {min(s+a.batch,len(pos))}/{len(pos)}", end="\r", flush=True)
     print(" " * 50, end="\r")
 
@@ -241,6 +249,73 @@ async def main() -> int:
         print(f"    {r['user']}  health={r['health']:.4f}  "
               f"debt=${r['debt_usd']:,.0f}" if r["debt_usd"] is not None else
               f"    {r['user']}  health={r['health']:.4f}")
+
+    # ---- per-market view ----------------------------------------------------------
+    #
+    # The aggregate bands are misleading on their own: one market (USDC borrowed against
+    # USDe at 91.5% LLTV) held $191.9M of the $193M sitting within 5% of liquidation, and
+    # a stablecoin looped against a stablecoin sits near its limit BY DESIGN rather than
+    # in distress. Splitting by market separates that from genuine risk, and pairing it
+    # with collateral depth answers the question that actually decides whether a
+    # liquidation is worth taking: could the seized collateral be sold?
+    at_risk = [r for r in live if r["health"] < a.at_risk_below]
+    by_market: dict[str, dict] = {}
+    for r in at_risk:
+        m = by_market.setdefault(r["market"], {"debt": 0.0, "n": 0,
+                                               "coll": r["collateral"], "lltv": r["lltv"],
+                                               "loan": r["loan"]})
+        m["n"] += 1
+        m["debt"] += r["debt_usd"] or 0.0
+
+    if by_market:
+        # collateral depth: what every registered pool holds of that token
+        depth: dict[str, float] = {}
+        try:
+            import asyncpg
+            conn = await asyncpg.connect(a.pg)
+            prows = await conn.fetch("select address,token0,token1 from verified_pools")
+            await conn.close()
+            holders: dict[str, list[str]] = defaultdict(list)
+            wanted = {m["coll"] for m in by_market.values()}
+            for pr_ in prows:
+                for t in (pr_["token0"].lower(), pr_["token1"].lower()):
+                    if t in wanted:
+                        holders[t].append(pr_["address"])
+            for tok, pools in holders.items():
+                total = 0
+                for s_ in range(0, len(pools), a.batch):
+                    calls = [(tok, bytes.fromhex("70a08231") + int(p_, 16).to_bytes(32, "big"))
+                             for p_ in pools[s_:s_ + a.batch]]
+                    rr = await rpc(w3, "eth_call",
+                                   [{"to": MULTICALL3, "data": encode_multicall(calls)}, "latest"])
+                    if "result" not in rr:
+                        continue
+                    for ok, data in decode_multicall(rr["result"]):
+                        if ok and len(data) >= 32:
+                            total += int.from_bytes(data[0:32], "big")
+                dec = 18
+                try:
+                    dec = int((await rpc(w3, "eth_call", [{"to": tok, "data": DECIMALS}, "latest"]))["result"], 16)
+                except Exception:
+                    pass
+                depth[tok] = total / 10 ** dec
+        except Exception as e:
+            print(f"  (collateral depth unavailable: {type(e).__name__})", file=sys.stderr)
+
+        print(f"\n  at-risk debt by market (health < {a.at_risk_below}):")
+        print(f"    {'collateral':>12} {'lltv':>6} {'positions':>10} {'debt':>16} {'pool depth (tokens)':>22}")
+        for mid, m in sorted(by_market.items(), key=lambda kv: -kv[1]["debt"]):
+            csym = "?"
+            try:
+                sy = (await rpc(w3, "eth_call", [{"to": m["coll"], "data": SYMBOL}, "latest"]))["result"]
+                raw = bytes.fromhex(sy[2:])
+                if len(raw) >= 64:
+                    csym = raw[64:64 + int.from_bytes(raw[32:64], "big")].decode("utf8", "ignore") or "?"
+            except Exception:
+                pass
+            d = depth.get(m["coll"])
+            dtxt = f"{d:,.2f}" if d is not None else "unknown"
+            print(f"    {csym:>12} {m['lltv']:>6.1%} {m['n']:>10,} ${m['debt']:>15,.0f} {dtxt:>22}")
 
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, f"morpho-pipeline-{latest}.json")

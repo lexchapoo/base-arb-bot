@@ -102,7 +102,7 @@ def main() -> int:
             print("    (none -- liquidations are bursty; 0 over 24h is normal)")
 
     alerts = []
-    for label, key in (("aave", "aave"), ("morpho", "morpho")):
+    for label, key in (("morpho", "morpho"), ("aave", "aave")):
         # Baseline against the earliest run that actually reported this protocol, not
         # blindly against recent[0]. Early runs predate the Morpho pipeline and the
         # borrower-accumulation fix, so comparing to them reported a field appearing for

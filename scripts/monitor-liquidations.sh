@@ -18,11 +18,13 @@ cd "$REPO" || exit 1
   echo "=== $(date -Is) ==="
   timeout 1800 "$PY" scripts/compare_lending_markets.py --blocks "$BLOCKS" 2>&1 \
     | grep -vE "^\s+[0-9]+/[0-9]+" | grep -E "liquidations|total gross bonus|protocol|morpho|moonwell|aave"
+  echo "--- morpho pipeline (primary: carries the liquidation volume) ---"
+  timeout 1800 "$PY" scripts/collect_morpho_pipeline.py 2>&1 \
+    | grep -vE "scanned |positions [0-9]+/" \
+    | grep -E "health |liquidatable|open borrows|tracked|at-risk debt by market|^\s+[A-Za-z]+\s+[0-9.]+%"
+  echo "--- aave v3 (secondary: small book, but liquid collateral) ---"
   timeout 1800 "$PY" scripts/collect_liquidations.py --blocks "$BLOCKS" 2>&1 \
     | grep -vE "scanned to|health factors" | grep -E "HF |liquidatable|borrowers with open debt"
-  echo "--- morpho pipeline (where the liquidation volume actually is) ---"
-  timeout 1800 "$PY" scripts/collect_morpho_pipeline.py 2>&1 \
-    | grep -vE "scanned |positions [0-9]+/" | grep -E "health |liquidatable|open borrows|tracked"
 } >> "$LOG" 2>&1
 
 # keep the log bounded
